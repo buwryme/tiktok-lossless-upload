@@ -16,6 +16,9 @@ python3 tiktok_lossless_patch.py video.mp4
 # Or save to new file
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
+### ⚠️ Disclaimer
+- TikTok may patch this at anytime. 
+- I might choose to not update this repo to keep up with their patches.
 
 ### Special Thanks
 - MASKA's upload method extension, for not having their code obfuscated. <3
