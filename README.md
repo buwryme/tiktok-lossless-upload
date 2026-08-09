@@ -18,6 +18,7 @@ python3 tiktok_lossless_patch.py video.mp4
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
 ### ⚠️ Disclaimer
+- This repo has been published **strictly** for educational purposes on TikTok's uploading process.
 - TikTok may patch this at anytime. 
 - I might choose to not update this repo to keep up with their patches.
 
