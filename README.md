@@ -6,6 +6,7 @@ Patch your videos to upload them to TikTok losslessly, but now fully open source
 Methods like itzcrih's method are highly credible for being functional, BUT:
 - They are closed source.
 - Their processing is done on their servers, which raises privacy concerns.
+
 This simple project brings lossless uploading to being open sourced
 
 ### Usage:
