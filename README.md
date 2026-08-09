@@ -25,6 +25,7 @@ python3 tiktok_lossless_patch.py input.mp4 output.mp4
 - Published **strictly** for educational purposes.
 - TikTok may patch this at anytime. 
 - Additionally to what's said above, I may choose to not update this repo to keep up with their patches.
+- Works only on Chrome-based browsers (Gecko/Firefox fails to process the cover due to ELST entry count patching, which makes the Post button grayed out)
 
 ### Special Thanks
 - MASKA's browser extension, as their code wasn't obfuscated, which made making this technique possible. Their GitHub repo is outdated; this implementation was ported from their latest extension version.
