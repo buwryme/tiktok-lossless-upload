@@ -7,9 +7,12 @@ Methods like itzcrih's method are highly credible for being functional, BUT:
 - They are closed source.
 - Their processing is done on their servers, which raises privacy concerns.
 
-This simple project brings lossless uploading to being open sourced
+This simple project brings lossless uploading into an open source manner.
 
 ### Usage:
+#### Requirements:
+- Python 3.6+. No pip packages required.
+
 ```py
 # Patch in place (overwrites original)
 python3 tiktok_lossless_patch.py video.mp4
@@ -17,12 +20,13 @@ python3 tiktok_lossless_patch.py video.mp4
 # Or save to new file
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
+
 ### ⚠️ Disclaimer
-- This repo has been published **strictly** for educational purposes on TikTok's uploading process.
+- Published **strictly** for educational purposes.
 - TikTok may patch this at anytime. 
-- I might choose to not update this repo to keep up with their patches.
+- Additionally to what's said above, I may choose to not update this repo to keep up with their patches.
 
 ### Special Thanks
-- MASKA's upload method extension, for not having their code close sourced or extension obfuscated. (FYI, their GitHub repo is outdated, so methods used in this repo were ported to Python from the latest version of their extension.)
+- MASKA's browser extension, as their code wasn't obfuscated, which made making this technique possible. Their GitHub repo is outdated; this implementation was ported from their latest extension version.
 
 > For legal inquiries, contact @buwryy on Discord.
