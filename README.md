@@ -21,7 +21,9 @@ python3 tiktok_lossless_patch.py video.mp4
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
 
-After patching, upload the result into TikTok via any Chrome-based browser. No extra steps from here.
+After patching, upload the result into TikTok via any Chrome-based browser on **desktop**. No extra steps from here.
+
+For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do.
 
 ### ⚠️ Disclaimer
 - Published **strictly** for educational purposes.
