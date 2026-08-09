@@ -1,5 +1,5 @@
 # Video Patcher for TikTok to allow lossless uploading.
-Patch your videos to upload them to TikTok losslessly, but now fully open source.
+Patch your videos to upload them to TikTok without TikTok re-encoding them (lossless), but now fully open source.
 
 ### Why?
 
@@ -23,6 +23,6 @@ python3 tiktok_lossless_patch.py input.mp4 output.mp4
 - I might choose to not update this repo to keep up with their patches.
 
 ### Special Thanks
-- MASKA's upload method extension, for not having their code closed sourced. (FYI, their GitHub repo is outdated, so methods used in this repo were ported to Python from the latest version of their extension.)
+- MASKA's upload method extension, for not having their code close sourced or extension obfuscated. (FYI, their GitHub repo is outdated, so methods used in this repo were ported to Python from the latest version of their extension.)
 
 > For legal inquiries, contact @buwryy on Discord.
