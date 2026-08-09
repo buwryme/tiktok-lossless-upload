@@ -21,9 +21,11 @@ python3 tiktok_lossless_patch.py video.mp4
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
 
+After patching, upload the result into TikTok via any Chrome-based browser. No extra steps from here.
+
 ### ⚠️ Disclaimer
 - Published **strictly** for educational purposes.
-- TikTok may patch this at anytime. 
+- TikTok may patch this at anytime. (Works as of *August 9th, 2026*)
 - Additionally to what's said above, I may choose to not update this repo to keep up with their patches.
 - Works only on Chrome-based browsers (Gecko/Firefox fails to process the cover due to ELST entry count patching, which makes the Post button grayed out)
 
