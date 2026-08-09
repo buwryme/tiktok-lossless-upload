@@ -3,7 +3,7 @@ Patch your videos to upload them to TikTok without TikTok re-encoding them (loss
 
 ### Why?
 
-Methods like itzcrih's method are highly credible for being functional, BUT:
+Methods like itzcrih's on-website video patching or Editing News' extensions are highly credible for being functional, BUT:
 - They are closed source.
 - Their processing is done on their servers, which raises privacy concerns.
 
