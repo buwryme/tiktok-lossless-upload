@@ -32,6 +32,7 @@ For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upl
 - Works only on Chrome-based browsers (Gecko/Firefox fails to process the cover due to ELST entry count patching, which makes the Post button grayed out)
 
 ### Special Thanks
-- MASKA's browser extension, as their code wasn't obfuscated, which made making this technique possible. Their GitHub repo is outdated; this implementation was ported from their latest extension version.
+- MASKA's OSS browser extension for ELST box inflation technique
+- irgifebry's NoBlur repo for sample table inflation technique
 
 > For legal inquiries, contact @buwryy on Discord.
