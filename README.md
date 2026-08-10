@@ -25,6 +25,10 @@ After patching, upload the result into TikTok via any Chrome-based browser on **
 
 For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do.
 
+### How it works
+- Inflates ELST boxes from 0x1 to 0x10000001 (thanks to MASKA's extension!)
+- Inflates sample boxes (thanks to `irgifebry/NoBlur`!)
+
 ### ⚠️ Disclaimer
 - Published **strictly** for educational purposes.
 - TikTok may patch this at anytime. (Works as of *August 10th, 2026*)
