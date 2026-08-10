@@ -54,6 +54,66 @@ def write_u32be(data: bytearray, offset: int, value: int):
     struct.pack_into('>I', data, offset, value & 0xFFFFFFFF)
 
 
+def add_itunes_metadata(data: bytearray) -> bytearray:
+    """
+    Add iTunes-style metadata so TikTok thinks this came from a pro editor.
+    
+    Injects a udta > meta > hdlr atom chain into moov, mimicking what
+    Final Cut Pro or Premiere Pro would write. Helps trigger the bypass.
+    """
+    moov_pos = find_box(data, b'moov')
+    if moov_pos == -1:
+        return data
+    
+    moov_size = read_u32be(data, moov_pos)
+    
+    # Don't double-add if udta already exists
+    existing_udta = find_box(data, b'udta', moov_pos)
+    if existing_udta != -1 and existing_udta < moov_pos + moov_size:
+        print("  udta already there, skipping metadata")
+        return data
+    
+    # hdlr: handler declaration saying "apple made this"
+    hdlr = bytearray([
+        0x00, 0x00, 0x00, 0x21,  # size = 33
+        0x68, 0x64, 0x6c, 0x72,  # 'hdlr'
+        0x00, 0x00, 0x00, 0x00,  # version/flags
+        0x00, 0x00, 0x00, 0x00,  # pre_defined
+        0x61, 0x70, 0x70, 0x6c,  # handler_type = 'appl'
+        0x00, 0x00, 0x00, 0x00,  # reserved
+        0x00, 0x00, 0x00, 0x00,  # reserved
+        0x00, 0x00, 0x00, 0x00,  # reserved
+        0x00,                    # name (empty)
+    ])
+    
+    # meta container (needs flags byte)
+    meta_hdr = bytearray([
+        0x00, 0x00, 0x00, 0x00,  # size placeholder
+        0x6d, 0x65, 0x74, 0x61,  # 'meta'
+        0x00, 0x00, 0x00, 0x21,  # version/flags
+    ])
+    meta_size = 12 + len(hdlr)
+    write_u32be(meta_hdr, 0, meta_size)
+    
+    # udta wrapper
+    udta_inner = meta_hdr + hdlr
+    udta_size = 8 + len(udta_inner)
+    udta_atom = bytearray(udta_size)
+    write_u32be(udta_atom, 0, udta_size)
+    udta_atom[4:8] = b'udta'
+    udta_atom[8:] = udta_inner
+    
+    # Stuff it at the end of moov
+    insert_at = moov_pos + moov_size
+    data[insert_at:insert_at] = udta_atom
+    
+    # Fix moov's size field
+    write_u32be(data, moov_pos, moov_size + len(udta_atom))
+    
+    print(f"  injected itunes metadata ({len(udta_atom)} bytes)")
+    return data
+
+
 def patch_mp4(input_path: str, output_path: str = None) -> bool:
     """
     Patch an MP4 file's ELST box to trigger TikTok's lossless passthrough.
@@ -80,6 +140,9 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
         print("  no ELST box found — this file might already be simple")
         print("  or ffmpeg didn't create one. trying anyway...")
         
+        # Still inject metadata even without ELST — can't hurt
+        data = add_itunes_metadata(data)
+        
         # Some files don't have ELST at all — that's actually fine
         # TikTok might still pass them through if they look clean enough
         # But we can't patch what doesn't exist, so just copy and bail
@@ -101,6 +164,9 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
     
     print(f"  found ELST at byte {elst_pos}")
     print(f"  patched: 0x{old_val:08X} → 0x{new_val:08X}")
+    
+    # Inject iTunes metadata so it looks like pro editor output
+    data = add_itunes_metadata(data)
     
     # Write it out
     try:
