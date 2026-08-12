@@ -32,7 +32,7 @@ For the best results, make sure your video:
 
 After patching, upload the result into TikTok via any Chrome-based browser on **desktop**. No extra steps from here.
 
-For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do.
+For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do. (Might not work on iOS!)
 
 ### How it works
 - Inflates ELST boxes from 0x1 to 0x10000001 (thanks to MASKA's extension!)
