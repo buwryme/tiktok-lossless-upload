@@ -2,7 +2,9 @@
 """
 tiktok_lossless_patch.py
 
-Patches MP4 files so TikTok skips re-encoding and keeps them lossless.
+TikTok Optimization Pipeline:
+  1. Encode with libx264 (ALWAYS - ensures TikTok-compatible output)
+  2. Patch ELST boxes for TikTok passthrough
 
 How it works: TikTok's uploader checks for an "edit list" (ELST box) in
 MP4 files. If the edit list looks complex enough (like it came from a pro
@@ -12,19 +14,18 @@ just passes the video through as-is.
 This script corrupts the ELST entry count to an absurdly large number,
 which tricks TikTok into thinking "oh wow, professional edit, better not touch this."
 
-Also includes NoBlur-style sample table inflation (10x) which makes TikTok
-see way more samples than actually exist, further reducing recompression.
-
 ^ P.S. this is speculation.
 
 Usage:
-    python3 tiktok_lossless_patch.py input.mp4 [output.mp4]
+    python3 tiktok_lossless_patch.py input_file [output.mp4]
 
-If no output is given, it overwrites the original file.
+    Accepts ANY input format (mp4, mov, avi, mkv, prores, etc.)
+    For best results, use lossless or topaz-enhanced output as input.
+
+If no output is given, auto-generates filename.
 
 Credits:
     MASKA's OSS browser extension for the ELST technique
-    irgifebry's NoBlur OSS client-side processor for the sample table inflation technique
 
 For legal inquiries, contact @buwryy on Discord.
 
@@ -33,25 +34,19 @@ LICENSE: MIT License, copyright holder: buwryme @ GitHub
 
 import sys
 import struct
+import subprocess
+import os
+from pathlib import Path
 
 
 # The magic value we write into the ELST box
 # 0x10000001 = 268,435,457 entries... yeah right, TikTok
 ELST_MAGIC = 0x10000001
 
-# NoBlur inflation settings
-INFLATE_MULT = 10  # 10x sample density
 
-# Codec-aware dummy sample sizes (how big fake samples should be)
-DUMMY_SIZES = {
-    b"avc1": 8, b"avc3": 8,    # H.264
-    b"hvc1": 16, b"hev1": 16,   # H.265/HEVC
-    b"vp09": 4,                # VP9
-    b"av01": 4,                # AV1
-    b"mp4v": 8,                # MPEG-4 Visual
-}
-DEFAULT_DUMMY = 8
-
+# ════════════════════════════════════════════════════════════════════════
+# MP4 PARSING UTILITIES
+# ════════════════════════════════════════════════════════════════════════
 
 def find_box(data: bytes | bytearray, fourcc: bytes | str, start: int = 0) -> int:
     """Find an MP4 atom by its FourCC code. Returns offset or -1."""
@@ -102,7 +97,9 @@ def parse_boxes(data: bytearray, start: int, end: int) -> list[dict]:
     return boxes
 
 
-# MASKA's ELST inflation & iTunes metadata injection
+# ════════════════════════════════════════════════════════════════════════
+# ELST PATCHING & METADATA FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════
 
 def add_itunes_metadata(data: bytearray) -> bytearray:
     """
@@ -120,7 +117,7 @@ def add_itunes_metadata(data: bytearray) -> bytearray:
     # Don't double-add if udta already exists
     existing_udta = find_box(data, b'udta', moov_pos)
     if existing_udta != -1 and existing_udta < moov_pos + moov_size:
-        print("  udta already there, skipping metadata")
+        print("       udta already there, skipping")
         return data
 
     # hdlr: handler declaration saying "apple made this"
@@ -160,7 +157,7 @@ def add_itunes_metadata(data: bytearray) -> bytearray:
     # Fix moov's size field
     write_u32be(data, moov_pos, moov_size + len(udta_atom))
 
-    print(f"  injected itunes metadata ({len(udta_atom)} bytes)")
+    print(f"       injected itunes metadata ({len(udta_atom)} bytes)")
     return data
 
 
@@ -181,163 +178,12 @@ def patch_all_elst(data: bytearray) -> int:
             old = read_u32be(data, pos + 8)
             entries = read_u32be(data, pos + 12)
             write_u32be(data, pos + 8, ELST_MAGIC)
-            print(f"  elst #{count+1} @ {pos}: {old:#010x} -> {ELST_MAGIC:#010x} ({entries} entries)")
+            print(f"       elst #{count+1} @ {pos}: {old:#010x} -> {ELST_MAGIC:#010x} ({entries} entries)")
             count += 1
 
         search = pos + 4
 
     return count
-
-
-# NoBlur's sample table inflation
-
-def find_video_stbl(moov: dict, data: bytearray) -> dict | None:
-    """Find video track's sample table (stbl)."""
-    for trak in parse_boxes(data, moov["offset"] + 8, moov["end"]):
-        if trak["type"] != b"trak":
-            continue
-
-        for mdia in parse_boxes(data, trak["offset"] + 8, trak["end"]):
-            if mdia["type"] != b"mdia":
-                continue
-
-            # Check for 'vide' handler type
-            has_video = False
-            for hdlr in parse_boxes(data, mdia["offset"] + 8, mdia["end"]):
-                if hdlr["type"] == b"hdlr":
-                    for i in range(hdlr["offset"] + 8, min(hdlr["end"], hdlr["offset"] + 100) - 3):
-                        if data[i:i+4] == b"vide":
-                            has_video = True
-                            break
-                    break
-
-            if not has_video:
-                continue
-
-            # Found video track, look for stbl
-            for minf in parse_boxes(data, mdia["offset"] + 8, mdia["end"]):
-                if minf["type"] != b"minf":
-                    continue
-                for stbl in parse_boxes(data, minf["offset"] + 8, minf["end"]):
-                    if stbl["type"] == b"stbl":
-                        return {"trak": trak, "mdia": mdia, "minf": minf, "stbl": stbl}
-
-    return None
-
-
-def detect_codec(stbl: dict, data: bytearray) -> bytes:
-    """Detect video codec FourCC from stsd inside stbl."""
-    for child in parse_boxes(data, stbl["offset"] + 8, stbl["end"]):
-        if child["type"] == b"stsd":
-            cs = child["offset"] + 16  # After header + ver/flags + entry_count
-            if cs + 16 <= child["end"]:
-                return bytes(data[cs:cs+4])
-    return b"unk"
-
-
-def build_inflated_stts(real_count: int, sample_delta: int, mult: int) -> bytearray:
-    """Build inflated stts (time-to-sample) atom."""
-    fake_count = real_count * (mult - 1)
-    # [size][stts][ver=0][count=2][real_count][delta][fake_count][delta]
-    atom_size = 16 + 16
-    a = bytearray(atom_size)
-    write_u32be(a, 0, atom_size)
-    a[4:8] = b'stts'
-    write_u32be(a, 8, 0)           # version/flags
-    write_u32be(a, 12, 2)          # entry_count = 2
-    write_u32be(a, 16, real_count) # entry 1: sample_count
-    write_u32be(a, 20, sample_delta)  # entry 1: delta
-    write_u32be(a, 24, fake_count) # entry 2: sample_count (fake)
-    write_u32be(a, 28, sample_delta)  # entry 2: delta
-    return a
-
-
-def build_inflated_stsz(data: bytearray, stsz: dict, real_count: int, mult: int, dummy: int) -> bytearray:
-    """Build inflated stsz (sample sizes) atom."""
-    total_count = real_count * mult
-    atom_size = 20 + total_count * 4
-    a = bytearray(atom_size)
-    write_u32be(a, 0, atom_size)
-    a[4:8] = b'stzs'              # NOTE: correct FourCC is 'stsz'!
-    write_u32be(a, 8, 0)          # version/flags
-    write_u32be(a, 12, 0)         # default_size (0 = variable)
-    write_u32be(a, 16, total_count)  # sample_count
-
-    base = stsz["offset"] + 20   # Start of size entries
-    for i in range(real_count):
-        write_u32be(a, 20 + i*4, read_u32be(data, base + i*4))
-    for i in range(real_count, total_count):
-        write_u32be(a, 20 + i*4, dummy)  # Fake samples get dummy size
-    return a
-
-
-def build_inflated_stco(data: bytearray, stco: dict, orig_count: int, real_count: int,
-                        safe_offset: int, delta: int, mult: int) -> bytearray:
-    """Build inflated stco (chunk offsets, 32-bit) atom."""
-    fake_count = real_count * (mult - 1)
-    new_count = orig_count + fake_count
-    atom_size = 16 + new_count * 4
-    a = bytearray(atom_size)
-    write_u32be(a, 0, atom_size)
-    a[4:8] = b'stco'
-    write_u32be(a, 8, 0)
-    write_u32be(a, 12, new_count)
-
-    base = stco["offset"] + 16
-    for i in range(orig_count):
-        write_u32be(a, 16 + i*4, read_u32be(data, base + i*4) + delta)
-    for i in range(fake_count):
-        write_u32be(a, 16 + (orig_count+i)*4, safe_offset)  # Point to EOF padding
-    return a
-
-
-def build_inflated_co64(data: bytearray, co64: dict, orig_count: int, real_count: int,
-                         safe_offset: int, delta: int, mult: int) -> bytearray:
-    """Build inflated co64 (chunk offsets, 64-bit) atom."""
-    fake_count = real_count * (mult - 1)
-    new_count = orig_count + fake_count
-    atom_size = 16 + new_count * 8
-    a = bytearray(atom_size)
-    write_u32be(a, 0, atom_size)
-    a[4:8] = b'co64'
-    write_u32be(a, 8, 0)
-    write_u32be(a, 12, new_count)
-
-    base = co64["offset"] + 16
-    for i in range(orig_count):
-        hi = read_u32be(data, base + i*8)
-        lo = read_u32be(data, base + i*8 + 4)
-        val = (hi * 0x100000000 + lo) + delta
-        write_u32be(a, 16 + i*8, (val >> 32) & 0xFFFFFFFF)
-        write_u32be(a, 16 + i*8 + 4, val & 0xFFFFFFFF)
-    for i in range(fake_count):
-        write_u32be(a, 16 + (orig_count+i)*8, 0)       # hi = 0
-        write_u32be(a, 16 + (orig_count+i)*8 + 4, safe_offset)  # lo
-    return a
-
-
-def build_patched_stsc(data: bytearray, stsc: dict, orig_chunk_count: int) -> bytearray:
-    """Build patched stsc (sample-to-chunk) with extra entry for fake samples."""
-    orig_entries = read_u32be(data, stsc["offset"] + 12)
-    new_entries = orig_entries + 1
-    atom_size = 16 + new_entries * 12
-    a = bytearray(atom_size)
-    write_u32be(a, 0, atom_size)
-    a[4:8] = b'stsc'
-    write_u32be(a, 8, 0)
-    write_u32be(a, 12, new_entries)
-
-    base = stsc["offset"] + 16
-    for i in range(orig_entries):
-        write_u32be(a, 16 + i*12,     read_u32be(data, base + i*12))      # first_chunk
-        write_u32be(a, 16 + i*12 + 4, read_u32be(data, base + i*12 + 4))  # samples_per_chunk
-        write_u32be(a, 16 + i*12 + 8, read_u32be(data, base + i*12 + 8))  # sample_desc_index
-
-    # Extra entry: fake samples start after real ones, 1 per chunk
-    write_u32be(a, 16 + orig_entries*12, orig_chunk_count + 1)
-    write_u32be(a, 16 + orig_entries*12 + 4, 1)
-    write_u32be(a, 16 + orig_entries*12 + 8, 1)
-    return a
 
 
 def fix_offsets_recursive(data: bytearray, start: int, end: int, split: int, delta: int):
@@ -404,22 +250,11 @@ def normalize_container(data: bytearray) -> tuple[bytearray, bool]:
         brand = data[ftyp["offset"]+8:ftyp["offset"]+12]
         if brand != b"isom":
             needs_rewrite = True
-            located = find_video_stbl(moov, data)
-            is_hevc = False
-            if located:
-                c = detect_codec(located["stbl"], data)
-                is_hevc = c in (b"hvc1", b"hev1")
-
-            if is_hevc:
-                new_ftyp = bytearray([0,0,0,32, 0x66,0x74,0x79,0x70,
-                    0x69,0x73,0x6f,0x34, 0,0,2,0,
-                    0x69,0x73,0x6f,0x6d, 0x69,0x73,0x6f,0x32,
-                    0x68,0x76,0x63,0x31, 0x6d,0x70,0x34,0x31])
-            else:
-                new_ftyp = bytearray([0,0,0,28, 0x66,0x74,0x79,0x70,
-                    0x69,0x73,0x6f,0x6d, 0,0,2,0,
-                    0x69,0x73,0x6f,0x6d, 0x69,0x73,0x6f,0x32,
-                    0x6d,0x70,0x34,0x31])
+            # Use isom brand (simplified)
+            new_ftyp = bytearray([0,0,0,28, 0x66,0x74,0x79,0x70,
+                0x69,0x73,0x6f,0x6d, 0,0,2,0,
+                0x69,0x73,0x6f,0x6d, 0x69,0x73,0x6f,0x32,
+                0x6d,0x70,0x34,0x31])
 
     # Rebuild: ftyp -> moov -> mdat
     fd = new_ftyp if (needs_rewrite and new_ftyp) else (data[ftyp["offset"]:ftyp["end"]] if ftyp else b"")
@@ -442,200 +277,8 @@ def normalize_container(data: bytearray) -> tuple[bytearray, bool]:
     return out, True
 
 
-def try_inflate_sample_table(data: bytearray, mult: int = INFLATE_MULT) -> tuple[bytearray, list[str]]:
-    """
-    Try to apply NoBlur's sample table inflation.
-
-    Inflates whatever sample table boxes we find. Doesn't fail if some are missing -
-    just does what it can and returns warnings about what couldn't be done.
-
-    Returns (modified_data, list_of_warnings).
-    """
-    warnings = []
-
-    if mult < 2:
-        return data, ["inflation multiplier must be >= 2"]
-
-    fsize = len(data)
-    top = parse_boxes(data, 0, fsize)
-
-    # Find moov
-    moov = None
-    for b in top:
-        if b["type"] == b"moov":
-            moov = b; break
-    if not moov:
-        return data, ["no moov box found"]
-
-    # Find video track's stbl
-    located = find_video_stbl(moov, data)
-    if not located:
-        return data, ["no video track found"]
-
-    stbl = located["stbl"]
-    kids = parse_boxes(data, stbl["offset"] + 8, stbl["end"])
-
-    # Find what we have
-    stts = stsz = stco = co64 = stsc = None
-    for k in kids:
-        t = k["type"]
-        if t == b'stts': stts = k
-        elif t == b'stzs': stsz = k      # NOTE: correct FourCC!
-        elif t == b'stco': stco = k
-        elif t == b'co64': co64 = k
-        elif t == b'stsc': stsc = k
-
-    # Check required boxes
-    if not stts:
-        return data, ["missing stts (time-to-sample) box"]
-
-    # Count real samples from stts
-    entries = read_u32be(data, stts["offset"] + 12)
-    real_count = 0
-    total_dur = 0
-    base = stts["offset"] + 16
-    for i in range(entries):
-        c = read_u32be(data, base + i*8)
-        d = read_u32be(data, base + i*8 + 4)
-        real_count += c
-        total_dur += c * d
-
-    if real_count == 0:
-        return data, ["no video samples found in stts"]
-
-    sample_delta = round(total_dur / real_count)
-    codec = detect_codec(stbl, data)
-    dummy = DUMMY_SIZES.get(codec, DEFAULT_DUMMY)
-
-    print(f"  inflating {real_count} samples x{mult} (codec={codec.decode('ascii','replace')}, dummy={dummy}B)")
-
-    # Get chunk info
-    chunk_box = stco or co64
-    if not chunk_box:
-        return data, ["neither stco nor co64 found"]
-
-    orig_chunks = read_u32be(data, chunk_box["offset"] + 12)
-
-    # Build replacement atoms for what we HAVE
-    replacements = []  # (offset, new_bytes, old_size)
-
-    # Always need stts
-    new_stts = build_inflated_stts(real_count, sample_delta, mult)
-    replacements.append((stts["offset"], new_stts, stts["size"]))
-
-    # stsz if present
-    if stsz:
-        new_stsz = build_inflated_stsz(data, stsz, real_count, mult, dummy)
-        replacements.append((stsz["offset"], new_stsz, stsz["size"]))
-    else:
-        warnings.append("no stsz box - skipping sample size inflation")
-
-    # stsc if present
-    if stsc:
-        new_stsc = build_patched_stsc(data, stsc, orig_chunks)
-        replacements.append((stsc["offset"], new_stsc, stsc["size"]))
-    else:
-        warnings.append("no stsc box - skipping sample-to-chunk patching")
-
-    # Calculate size changes so far
-    partial_delta = sum(len(r[1]) - r[2] for r in replacements)
-
-    # Chunk offset box (stco or co64)
-    fake_count = real_count * (mult - 1)
-    safe_offset = fsize + partial_delta + (fake_count * dummy if stsz else 0)
-
-    # Account for chunk box growth too
-    chunk_entry_size = 4 if stco else 8
-    chunk_delta = fake_count * chunk_entry_size
-    safe_offset += chunk_delta
-    total_moov_delta = partial_delta + chunk_delta
-
-    if stco:
-        new_chunk = build_inflated_stco(data, stco, orig_chunks, real_count,
-                                        safe_offset, total_moov_delta, mult)
-        replacements.append((stco["offset"], new_chunk, stco["size"]))
-    elif co64:
-        new_chunk = build_inflated_co64(data, co64, orig_chunks, real_count,
-                                         safe_offset, total_moov_delta, mult)
-        replacements.append((co64["offset"], new_chunk, co64["size"]))
-
-    # Sort by offset for sequential processing
-    replacements.sort(key=lambda x: x[0])
-
-    # Calculate padding needed
-    pad_size = fake_count * dummy if stsz else 0
-    new_fsize = fsize + total_moov_delta + pad_size
-
-    # Build new file
-    out = bytearray(new_fsize)
-
-    rp = wp = 0
-    for rep_off, rep_bytes, old_sz in replacements:
-        # Copy up to this point
-        cl = rep_off - rp
-        out[wp:wp+cl] = data[rp:rp+cl]
-        wp += cl
-
-        # Insert new atom
-        out[wp:wp+len(rep_bytes)] = rep_bytes
-        wp += len(rep_bytes)
-
-        rp = rep_off + old_sz  # Skip past original
-
-    # Copy rest of file
-    out[wp:] = data[rp:]
-
-    # Update parent box sizes
-    for poff in [stbl["offset"], located["minf"]["offset"],
-                 located["mdia"]["offset"], located["trak"]["offset"], moov["offset"]]:
-        old_sz = read_u32be(out, poff)
-        write_u32be(out, poff, old_sz + total_moov_delta)
-
-    # If moov was before mdat, fix other tracks' offsets too
-    mdat = None
-    for b in top:
-        if b["type"] == b"mdat":
-            mdat = b; break
-
-    if mdat and moov["offset"] < mdat["offset"]:
-        updated_moov_sz = read_u32be(out, moov["offset"])
-        moov_end = moov["offset"] + updated_moov_sz
-
-        for trak in parse_boxes(out, moov["offset"] + 8, moov_end):
-            if trak["type"] != b"trak" or trak["offset"] == located["trak"]["offset"]:
-                continue
-
-            # Find stbl in other tracks
-            for tc in parse_boxes(out, trak["offset"] + 8, trak["end"]):
-                if tc["type"] != b"mdia":
-                    continue
-                for tcc in parse_boxes(out, tc["offset"] + 8, tc["end"]):
-                    if tcc["type"] != b"minf":
-                        continue
-                    for tccc in parse_boxes(out, tcc["offset"] + 8, tcc["end"]):
-                        if tccc["type"] != b"stbl" or tccc["offset"] == stbl["offset"]:
-                            continue
-
-                        for sc in parse_boxes(out, tccc["offset"] + 8, tccc["end"]):
-                            if sc["type"] == b"stco":
-                                cnt = read_u32be(out, sc["offset"] + 12)
-                                for j in range(cnt):
-                                    v = read_u32be(out, sc["offset"] + 16 + j*4)
-                                    write_u32be(out, sc["offset"] + 16 + j*4, v + total_moov_delta)
-                            elif sc["type"] == b"co64":
-                                cnt = read_u32be(out, sc["offset"] + 12)
-                                for j in range(cnt):
-                                    hi = read_u32be(out, sc["offset"] + 16 + j*8)
-                                    lo = read_u32be(out, sc["offset"] + 17 + j*8)
-                                    v = (hi * 0x100000000 + lo) + total_moov_delta
-                                    write_u32be(out, sc["offset"] + 16 + j*8, (v >> 32) & 0xFFFFFFFF)
-                                    write_u32be(out, sc["offset"] + 17 + j*8, v & 0xFFFFFFFF)
-
-    return out, warnings
-
-
 # ════════════════════════════════════════════════════════════════════════
-# MAIN PATCH FUNCTION
+# ELST PATCHING (main function)
 # ════════════════════════════════════════════════════════════════════════
 
 def patch_mp4(input_path: str, output_path: str = None) -> bool:
@@ -645,8 +288,7 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
     Applies:
       1. Maska ELST corruption method
       2. iTunes metadata injection
-      3. Container normalization (optional)
-      4. NoBlur sample table inflation (optional)
+      3. Container normalization
 
     Returns True if successful, False otherwise.
     """
@@ -665,10 +307,9 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
 
     print(f"  input: {input_path}")
     print(f"  size: {orig_size:,} bytes")
-    print()
 
     # Step 1: Patch ALL ELST boxes
-    print("  [1/4] patching elst...")
+    print("  [1/3] patching elst...")
     elst_count = patch_all_elst(data)
     if elst_count == 0:
         print("       no elst found (file might be simple)")
@@ -677,22 +318,17 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
 
     # Step 2: Add iTunes metadata
     print()
-    print("  [2/4] adding itunes metadata...")
+    print("  [2/3] adding itunes metadata...")
     data = add_itunes_metadata(data)
 
     # Step 3: Normalize container
     print()
-    print("  [3/4] normalizing container...")
+    print("  [3/3] normalizing container...")
     data, norm_changed = normalize_container(data)
     if norm_changed:
         print("       reordered to ftyp->moov->mdat")
     else:
         print("       already normalized")
-
-    # Step 4: Inflate sample tables
-    print()
-    print("  [4/4] inflating sample tables...")
-    data, inflate_warnings = try_inflate_sample_table(data, INFLATE_MULT)
 
     # Write output
     try:
@@ -704,62 +340,145 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
 
     final_size = len(data)
 
-    print()
     print(f"  done! ({orig_size:,} bytes in, {final_size:,} bytes out)")
-
-    # Show any warnings
-    if inflate_warnings:
-        print()
-        print("  warnings:")
-        for w in inflate_warnings:
-            print(f"    - {w}")
 
     return True
 
 
 # ════════════════════════════════════════════════════════════════════════
-# CLI
+# FFMPEG ENCODING
+# ════════════════════════════════════════════════════════════════════════
+
+def encode_for_tiktok(input_path: str, output_path: str) -> bool:
+    """
+    Encode video with TikTok-optimized libx264 settings.
+    
+    Uses:
+      - libx264, high profile, level 4.1
+      - 3000kbps bitrate, 3500k maxrate, 7000k bufsize
+      - yuv420p pixel format (required by TikTok)
+      - medium preset (good speed/quality balance)
+    """
+    cmd = [
+        "ffmpeg", "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-profile:v", "high",
+        "-level", "4.1",
+        "-b:v", "3000k",
+        "-maxrate", "3500k",
+        "-bufsize", "7000k",
+        "-pix_fmt", "yuv420p",
+        "-y",
+        output_path
+    ]
+    
+    print(f"  cmd: ffmpeg -i \"{input_path}\" \\")
+    print(f"       -c:v libx264 -preset medium -profile:v high -level 4.1 \\")
+    print(f"       -b:v 3000k -maxrate 3500k -bufsize 7000k \\")
+    print(f"       -pix_fmt yuv420p -y \"{output_path}\"")
+    print()
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        error_msg = result.stderr[-800:] if len(result.stderr) > 800 else result.stderr
+        print(f"  encode error:")
+        print(error_msg)
+        return False
+    
+    if os.path.exists(output_path):
+        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"  ✓ encoded ({size_mb:.1f} MB)")
+        return True
+    else:
+        print(f"  encode failed: output not created")
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# MAIN PIPELINE
 # ════════════════════════════════════════════════════════════════════════
 
 def main():
     if len(sys.argv) < 2:
         print("tiktok_lossless_patch.py")
         print()
-        print("usage:")
-        print(f"  python3 {sys.argv[0]} input.mp4")
-        print(f"  python3 {sys.argv[0]} input.mp4 output.mp4")
+        print("TikTok Optimization Pipeline")
         print()
-        print("patches mp4 files so tiktok doesn't re-encode them.")
-        print("combines maska elst method + noblur sample inflation.")
-        print("no output path = overwrite in place.")
+        print("usage:")
+        print(f"  python3 {sys.argv[0]} input_file [output.mp4]")
+        print()
+        print("accepts ANY video format (mp4, mov, avi, mkv, prores, etc.)")
+        print()
+        print("for BEST RESULTS use:")
+        print("  - lossless intermediate (ProRes, UT Video, FFV1, etc.)")
+        print("  - topaz-enhanced output")
+        print("  - source footage with minimal compression artifacts")
+        print()
+        print("pipeline:")
+        print("  1. encode with libx264 (yuv420p, high profile)")
+        print("  2. patch ELST boxes for TikTok passthrough")
+        print()
+        print("credits:")
+        print("  - MASKA's OSS browser extension for the ELST technique")
         sys.exit(1)
 
     input_file = sys.argv[1]
     output_file = sys.argv[2] if len(sys.argv) > 2 else None
-
-    print(f"          tiktok lossless patch")
-    print(f"──────────────────────────────────────────")
-    print(f"                            made by buwryy")
-    print(f"SPECIAL THANKS TO:")
-    print(f"        - Maska's OSS browser extension  ;")
-    print(f"        - irgifebry/NoBlur OSS patcher app")
-    print(f"  input:  {input_file}")
-    print(f"  output: {output_file or '(overwrite)'}")
+    
+    # Validate input
+    if not os.path.exists(input_file):
+        print(f"error: '{input_file}' not found")
+        sys.exit(1)
+    
+    # Generate output filename if not provided
+    if not output_file:
+        stem = Path(input_file).stem
+        output_file = f"{stem}_tiktok.mp4"
+    
+    # Print header
     print()
-
-    if not input_file.endswith('.mp4'):
-        print("  this is designed for .mp4 files. ymmv with other formats.")
+    print(f"          tiktok optimization pipeline")
+    print(f"───────────────────────────────────────────────")
+    print(f"                                 made by buwryy")
+    print(f"SPECIAL THANKS TO:")
+    print(f"                - Maska's OSS browser extension")
+    print()
+    print(f"  input:     {input_file}")
+    print(f"  output:    {output_file}")
+    print()
+    
+    # Show recommendation for non-lossless inputs
+    lossless_exts = ('.mov', '.avi', '.mkv', '.ffv1', '.utvideo', '.huff', '.prores')
+    is_likely_lossless = any(input_file.lower().endswith(ext) for ext in lossless_exts)
+    
+    if not is_likely_lossless:
+        print(f"  tip: for best quality, feed this script lossless/topazed output")
         print()
-
-    ok = patch_mp4(input_file, output_file)
-
-    if ok:
+    
+    # Step 1: Encode (ALWAYS encode, even if input is .mp4)
+    print(f"[Step 1/2] Encoding to H.264... (THIS MIGHT TAKE A WHILE -- PLEASE WAIT!!!)")
+    print()
+    
+    if not encode_for_tiktok(input_file, output_file):
         print()
-        print("  patched. credit me, buwryy, or not i don't care <3")
+        print(f"  encoding failed :(")
+        sys.exit(1)
+    
+    print()
+    
+    # Step 2: Patch
+    print(f"[Step 2/2] Patching ELST boxes...")
+    print()
+    
+    if patch_mp4(output_file):
+        print()
+        print(f"  done! ready for TikTok: {output_file}")
         return 0
     else:
         print()
-        print("  something went wrong :(")
+        print(f"  elst patching failed (file is still usable, might get re-encoded)")
         return 1
 
 
