@@ -14,7 +14,7 @@ This simple project brings lossless uploading into an open source manner.
 - Python 3.6+. No pip packages required.
 
 ```py
-# Patch in place (overwrites original)
+# Patch in place (would output to video_tiktok.mp4)
 python3 tiktok_lossless_patch.py video.mp4
 
 # Or save to new file
