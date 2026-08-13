@@ -358,7 +358,7 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
       - 3000kbps bitrate, 3500k maxrate, 7000k bufsize
       - yuv420p pixel format (required by TikTok)
       - AAC 256k audio (required by TikTok)
-      - medium preset (good speed/quality balance)
+      - medium preset (good speed/size balance)
     """
     cmd = [
         "ffmpeg", "-i", input_path,
