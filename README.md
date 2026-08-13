@@ -46,6 +46,5 @@ For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upl
 
 ### Special Thanks
 - MASKA's OSS browser extension for ELST box inflation technique
-- irgifebry's NoBlur repo for sample table inflation technique
 
 > For legal inquiries, contact @buwryy on Discord.
