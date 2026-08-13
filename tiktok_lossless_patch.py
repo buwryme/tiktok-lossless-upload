@@ -357,6 +357,7 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
       - libx264, high profile, level 4.1
       - 3000kbps bitrate, 3500k maxrate, 7000k bufsize
       - yuv420p pixel format (required by TikTok)
+      - AAC 256k audio (required by TikTok)
       - medium preset (good speed/quality balance)
     """
     cmd = [
@@ -369,6 +370,8 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
         "-maxrate", "3500k",
         "-bufsize", "7000k",
         "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "256k",
         "-y",
         output_path
     ]
@@ -376,7 +379,9 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
     print(f"  cmd: ffmpeg -i \"{input_path}\" \\")
     print(f"       -c:v libx264 -preset medium -profile:v high -level 4.1 \\")
     print(f"       -b:v 3000k -maxrate 3500k -bufsize 7000k \\")
-    print(f"       -pix_fmt yuv420p -y \"{output_path}\"")
+    print(f"       -pix_fmt yuv420p \\")
+    print(f"       -c:a aac -b:a 256k \\")
+    print(f"       -y \"{output_path}\"")
     print()
     
     result = subprocess.run(cmd, capture_output=True, text=True)
