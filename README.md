@@ -26,7 +26,7 @@ After patching, upload the result into TikTok via any Chrome-based browser on **
 For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do. (Might not work on iOS!)
 
 ### How it works
-- Encodes your input video into H264 with specific criteria (level 4.1, yuv420p, high profile, specific bitrate values...)
+- Encodes your input video into H264 with specific criteria (level 4.1, yuv420p, high profile, aac 256k, specific bitrate values...)
 - Inflates ELST boxes from 0x1 to 0x10000001 (thanks to MASKA's extension!)
 
 ### ⚠️ Disclaimer
