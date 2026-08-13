@@ -33,7 +33,7 @@ For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upl
 - Published **strictly** for educational purposes.
 - TikTok may patch this at anytime. (Works as of *August 13th, 2026*)
 - Additionally to what's said above, I may choose to not update this repo to keep up with their patches.
-- Works only on Chrome-based browsers (Gecko/Firefox fails to process the cover due to ELST entry count patching, which makes the Post button grayed out)
+- Works only on Chrome-based browsers (Gecko/Firefox fails to process the cover due to ELST entry count patching, which makes the Post button grayed out. Webkit/Safari/iOS untested!)
 
 ### Special Thanks
 - MASKA's OSS browser extension for ELST box inflation technique
