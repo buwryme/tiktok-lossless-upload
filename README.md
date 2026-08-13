@@ -21,22 +21,13 @@ python3 tiktok_lossless_patch.py video.mp4
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
 
-For the best results, make sure your video:
-
-- Has codec H264/AVC
-- Level 4.2
-- YUV 4:2:0
-- Reasonable bitrate (~12Mbps), or CRF around 18-21
-- File size under/around 30MB
-
-
 After patching, upload the result into TikTok via any Chrome-based browser on **desktop**. No extra steps from here.
 
 For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do. (Might not work on iOS!)
 
 ### How it works
+- Encodes your input video into H264 with specific criteria (level 4.1, yuv420p, high profile, specific bitrate values...)
 - Inflates ELST boxes from 0x1 to 0x10000001 (thanks to MASKA's extension!)
-- Inflates sample boxes (thanks to `irgifebry/NoBlur`!)
 
 ### ⚠️ Disclaimer
 - Published **strictly** for educational purposes.
