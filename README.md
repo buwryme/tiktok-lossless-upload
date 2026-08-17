@@ -33,10 +33,8 @@ This project brings lossless uploading into the open, runs entirely on your mach
 |---|---|---|
 | Python | 3.10+ | Uses PEP 604 union type syntax (`X \| Y`) |
 | FFmpeg | Any recent build | Must be available on system `$PATH` |
-| Browser | Firefox-based | Firefox, Zen Browser, Librefox... (see note below) |
 
-> ⚠️ **Browser Compatibility:** Chromium/Chrome-based browsers fail to generate cover thumbnails due to how they parse the manipulated sample tables, which grays out the Post button. Safari/iOS is untested.
-> **ALWAYS POST ON FIREFOX-BASED BROWSERS!**
+> ⚠️ **Browser Compatibility:** Should work on any browser. WebKit/iOS might fail.
 
 ---
 
