@@ -54,6 +54,10 @@ python3 tiktok_lossless_patch.py input.mp4 output.mp4
 
 On Android, use **Firefox in Desktop Mode** (or any Gecko browser) to upload. This is likely to work, but is not guaranteed. iOS is currently untested and likely unsupported, due to Apple enforcing WebKit on every browser
 
+### A note about 120 FPS / 4K...
+
+It's best to post your video as 1080p60 at most. Higher resolutions may get re-encoded by TikTok. (still technically possible!)
+
 ---
 
 ## How It Works
