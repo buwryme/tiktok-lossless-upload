@@ -60,11 +60,11 @@ On Android, use **Firefox in Desktop Mode** (or any Gecko browser) to upload. Th
 
 TikTok's ingest pipeline checks MP4 sample table consistency to decide whether to re-encode. This tool exploits that check through coordinated container-level manipulations:
 
-1. **Encodes** input to H.264 High Profile Level 4.1, yuv420p, AAC-LC 256kbps with bitrate values tuned to TikTok's expected ranges
+1. **Encodes** input to H.265 Main 10 Profile, yuv420ple, AAC 256kbps with bitrate values tuned to TikTok's expected ranges (up to 20K!)
 2. **Inflates** the audio `stsz` (sample size) table by repeating entries 10×, creating a deliberate mismatch between declared and actual sample counts
 3. **Rewrites** the audio `stts` (time-to-sample) table with specific entry values that maintain apparent duration while reinforcing the inconsistency
 4. **Strips** timecode tracks (`tmcd`) and track references (`tref`) that can trigger re-encoding
-5. **Injects** custom metadata under `moov/udta/meta/ilst` so you retain attribution without third-party watermarks
+5. **Injects** custom metadata under `moov/udta/meta/ilst` so you retain attribution without third-party watermarks (feel free to change the configurable metadata inside the script)
 
 The result is a file that strict transcoders reject (falling back to passthrough) while lenient players like TikTok's mobile decoder handle normally.
 
