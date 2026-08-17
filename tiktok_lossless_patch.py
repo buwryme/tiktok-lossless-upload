@@ -493,114 +493,239 @@ def patch_minf(minf_data: bytearray, is_audio: bool) -> bytearray:
 def patch_stbl(stbl_data: bytearray) -> bytearray:
     """
     Patch the sample table for audio track.
-    Key operation: inflate stsz by STSZ_INFLATE_FACTOR while leaving stts alone.
-    This creates the intentional mismatch that triggers passthrough.
+
+    Simple mobile-friendly strategy:
+      - Keep real audio samples first and intact.
+      - Inflate stsz by appending dummy tail samples.
+      - Keep stts at real sample count.
+      - Keep original stsc mapping for real samples.
+      - Add one dummy stsc entry + one dummy stco offset for the tail.
+
+    This preserves the stsz/stts mismatch that triggers passthrough,
+    while leaving the real audio playable.
     """
     stbl_inner_start = 8
     stbl_inner_end = len(stbl_data)
     stbl_children = parse_boxes(stbl_data, stbl_inner_start, stbl_inner_end)
 
-    new_stbl_children = []
-    original_sample_count = 0
+    stsz_box = None
+    stts_box = None
+    stsc_box = None
+    stco_box = None
+
+    for sc in stbl_children:
+        if sc["type"] == b'stsz':
+            stsz_box = sc
+        elif sc["type"] == b'stts':
+            stts_box = sc
+        elif sc["type"] == b'stsc':
+            stsc_box = sc
+        elif sc["type"] == b'stco':
+            stco_box = sc
+
+    if not stsz_box or not stts_box or not stsc_box or not stco_box:
+        return stbl_data
+
+    # ── Read original stsz sizes ───────────────────────────────────────
+    stsz_payload = stbl_data[stsz_box["offset"] + 8 + 4:stsz_box["end"]]
+
+    if len(stsz_payload) < 8:
+        return stbl_data
+
+    uniform_size = read_u32be(stsz_payload, 0)
+    sample_count = read_u32be(stsz_payload, 4)
+
     original_sample_sizes = []
 
-    # First pass: collect stsz data
-    for sc in stbl_children:
-        if sc["type"] == b'stsz':
-            stsz_payload = stbl_data[sc["offset"] + 8 + 4:sc["end"]]  # skip box header + fullbox
-            uniform_size = read_u32be(stsz_payload, 0)
-            sample_count = read_u32be(stsz_payload, 4)
-            original_sample_count = sample_count
+    if uniform_size == 0:
+        pos = 8
+        for _ in range(sample_count):
+            if pos + 4 > len(stsz_payload):
+                break
+            original_sample_sizes.append(read_u32be(stsz_payload, pos))
+            pos += 4
+    else:
+        original_sample_sizes = [uniform_size] * sample_count
 
-            if uniform_size == 0:
-                # Variable sizes
-                for i in range(sample_count):
-                    sz = read_u32be(stsz_payload, 8 + i * 4)
-                    original_sample_sizes.append(sz)
+    if not original_sample_sizes:
+        return stbl_data
+
+    real_count = len(original_sample_sizes)
+    extra_count = real_count * (STSZ_INFLATE_FACTOR - 1)
+
+    # ── Read original stsc entries ─────────────────────────────────────
+    stsc_payload = stbl_data[stsc_box["offset"] + 8 + 4:stsc_box["end"]]
+
+    if len(stsc_payload) < 4:
+        return stbl_data
+
+    stsc_entry_count = read_u32be(stsc_payload, 0)
+    stsc_entries = []
+    pos = 4
+
+    for _ in range(stsc_entry_count):
+        if pos + 12 > len(stsc_payload):
+            break
+
+        first_chunk = read_u32be(stsc_payload, pos)
+        samples_per_chunk = read_u32be(stsc_payload, pos + 4)
+        sample_desc_idx = read_u32be(stsc_payload, pos + 8)
+
+        stsc_entries.append((first_chunk, samples_per_chunk, sample_desc_idx))
+
+        pos += 12
+
+    last_sdi = stsc_entries[-1][2] if stsc_entries else 1
+
+    # ── Read original stco offsets ─────────────────────────────────────
+    stco_payload = stbl_data[stco_box["offset"] + 8 + 4:stco_box["end"]]
+
+    if len(stco_payload) < 4:
+        return stbl_data
+
+    stco_entry_count = read_u32be(stco_payload, 0)
+    stco_offsets = []
+    pos = 4
+
+    for _ in range(stco_entry_count):
+        if pos + 4 > len(stco_payload):
+            break
+
+        stco_offsets.append(read_u32be(stco_payload, pos))
+        pos += 4
+
+    if not stco_offsets:
+        return stbl_data
+
+    # ── Sanity-check original stsc mapping ─────────────────────────────
+    def stsc_total_samples(entries, chunk_count):
+        total = 0
+
+        for i, entry in enumerate(entries):
+            first_chunk, samples_per_chunk, _ = entry
+
+            if i + 1 < len(entries):
+                next_first_chunk = entries[i + 1][0]
             else:
-                original_sample_sizes = [uniform_size] * sample_count
+                next_first_chunk = chunk_count + 1
 
-    # Second pass: rebuild boxes
+            if next_first_chunk <= first_chunk:
+                continue
+
+            total += (next_first_chunk - first_chunk) * samples_per_chunk
+
+        return total
+
+    original_chunk_count = len(stco_offsets)
+
+    if not stsc_entries or stsc_total_samples(stsc_entries, original_chunk_count) != real_count:
+        # Fallback: describe all real samples as one chunk.
+        # This should rarely be needed for normal ffmpeg output.
+        stsc_entries = [(1, real_count, last_sdi)]
+        stco_offsets = [stco_offsets[0]]
+        original_chunk_count = 1
+
+    first_dummy_offset = stco_offsets[0]
+
+    # ── Build new stsz ─────────────────────────────────────────────────
+    #
+    # IMPORTANT:
+    # Real sample sizes come FIRST.
+    # Dummy sizes are appended AFTER the real audio.
+    #
+    # This is what keeps mobile playback alive.
+    #
+    new_sizes = list(original_sample_sizes)
+
+    for _ in range(STSZ_INFLATE_FACTOR - 1):
+        new_sizes.extend(original_sample_sizes)
+
+    new_count = len(new_sizes)
+
+    new_stsz_payload = struct.pack('>II', 0, new_count)
+    for sz in new_sizes:
+        new_stsz_payload += struct.pack('>I', sz)
+
+    new_stsz = build_fullbox(b'stsz', 0, 0, new_stsz_payload)
+
+    print(f"       inflated stsz: {real_count} → {new_count} samples (real-first tail)")
+
+    # ── Build new stts ─────────────────────────────────────────────────
+    #
+    # Keep real sample count.
+    # For the known 228-frame case, use the reference pattern.
+    # For other cases, preserve original stts.
+    #
+    if real_count == 228:
+        stts_payload = struct.pack('>I', 2)
+        stts_payload += struct.pack('>II', 227, 1024)
+        stts_payload += struct.pack('>II', 1, 560)
+
+        new_stts = build_fullbox(b'stts', 0, 0, stts_payload)
+
+        print("       forced audio stts: 2 entries → (227, 1024), (1, 560)")
+    else:
+        new_stts = bytes(stbl_data[stts_box["offset"]:stts_box["end"]])
+
+        print("       preserved original audio stts")
+
+    # ── Build new stsc ─────────────────────────────────────────────────
+    #
+    # Keep original entries for the real samples.
+    # Add one dummy entry for all appended samples.
+    #
+    new_stsc_entries = list(stsc_entries)
+
+    if extra_count > 0:
+        new_stsc_entries.append((
+            original_chunk_count + 1,
+            extra_count,
+            last_sdi
+        ))
+
+    new_stsc_payload = struct.pack('>I', len(new_stsc_entries))
+
+    for first_chunk, samples_per_chunk, sample_desc_idx in new_stsc_entries:
+        new_stsc_payload += struct.pack('>III', first_chunk, samples_per_chunk, sample_desc_idx)
+
+    new_stsc = build_fullbox(b'stsc', 0, 0, new_stsc_payload)
+
+    print(f"       adjusted stsc: {stsc_entry_count} → {len(new_stsc_entries)} entries (tail chunk)")
+
+    # ── Build new stco ─────────────────────────────────────────────────
+    #
+    # Keep original chunk offsets.
+    # Add one dummy offset for the dummy tail chunk.
+    #
+    new_stco_offsets = list(stco_offsets)
+
+    if extra_count > 0:
+        new_stco_offsets.append(first_dummy_offset)
+
+    new_stco_payload = struct.pack('>I', len(new_stco_offsets))
+
+    for off in new_stco_offsets:
+        new_stco_payload += struct.pack('>I', off)
+
+    new_stco = build_fullbox(b'stco', 0, 0, new_stco_payload)
+
+    print(f"       adjusted stco: {stco_entry_count} → {len(new_stco_offsets)} offsets (tail chunk)")
+
+    # ── Rebuild stbl ───────────────────────────────────────────────────
+    new_stbl_children = []
+
     for sc in stbl_children:
         if sc["type"] == b'stsz':
-            # Inflate sample sizes by repeating each entry STSZ_INFLATE_FACTOR times
-            inflated_sizes = []
-            for sz in original_sample_sizes:
-                for _ in range(STSZ_INFLATE_FACTOR):
-                    inflated_sizes.append(sz)
-
-            new_count = len(inflated_sizes)
-            stsz_payload = struct.pack('>II', 0, new_count)  # uniform=0, count
-            for sz in inflated_sizes:
-                stsz_payload += struct.pack('>I', sz)
-
-            new_stsz = build_fullbox(b'stsz', 0, 0, stsz_payload)
             new_stbl_children.append(new_stsz)
-            print(f"       inflated stsz: {original_sample_count} → {new_count} samples")
 
         elif sc["type"] == b'stts':
-            stts_payload = struct.pack('>I', 2)           # entry_count = 2
-            stts_payload += struct.pack('>II', 227, 1024) # entry[0]: 227 samples × 1024
-            stts_payload += struct.pack('>II', 1, 560)    # entry[1]: 1 sample × 560
-            new_stts = build_fullbox(b'stts', 0, 0, stts_payload)
             new_stbl_children.append(new_stts)
-            print("       forced audio stts: 2 entries → (227, 1024), (1, 560)")
 
         elif sc["type"] == b'stsc':
-            # Add one extra entry to stsc to account for inflated samples
-            stsc_payload = bytearray(stbl_data[sc["offset"] + 8 + 4:sc["end"]])
-            entry_count = read_u32be(stsc_payload, 0)
-
-            # Parse existing entries
-            entries = []
-            for i in range(entry_count):
-                off = 4 + i * 12
-                first_chunk = read_u32be(stsc_payload, off)
-                samples_per_chunk = read_u32be(stsc_payload, off + 4)
-                sample_desc_idx = read_u32be(stsc_payload, off + 8)
-                entries.append((first_chunk, samples_per_chunk, sample_desc_idx))
-
-            # Inflate samples_per_chunk by the same factor
-            inflated_entries = []
-            for fc, spc, sdi in entries:
-                inflated_entries.append((fc, spc * STSZ_INFLATE_FACTOR, sdi))
-
-            # Add one more entry at the end if needed
-            if len(inflated_entries) > 0:
-                last_fc = inflated_entries[-1][0]
-                inflated_entries.append((last_fc + 1, inflated_entries[-1][1], inflated_entries[-1][2]))
-
-            new_count = len(inflated_entries)
-            new_stsc_payload = struct.pack('>I', new_count)
-            for fc, spc, sdi in inflated_entries:
-                new_stsc_payload += struct.pack('>III', fc, spc, sdi)
-
-            new_stsc = build_fullbox(b'stsc', 0, 0, new_stsc_payload)
             new_stbl_children.append(new_stsc)
-            print(f"       adjusted stsc: {entry_count} → {new_count} entries")
 
         elif sc["type"] == b'stco':
-            # Add one extra chunk offset entry
-            stco_payload = bytearray(stbl_data[sc["offset"] + 8 + 4:sc["end"]])
-            entry_count = read_u32be(stco_payload, 0)
-
-            offsets = []
-            for i in range(entry_count):
-                off = read_u32be(stco_payload, 4 + i * 4)
-                offsets.append(off)
-
-            # Duplicate last offset as extra entry
-            if offsets:
-                offsets.append(offsets[-1])
-
-            new_count = len(offsets)
-            new_stco_payload = struct.pack('>I', new_count)
-            for off in offsets:
-                new_stco_payload += struct.pack('>I', off)
-
-            new_stco = build_fullbox(b'stco', 0, 0, new_stco_payload)
             new_stbl_children.append(new_stco)
-            print(f"       adjusted stco: {entry_count} → {new_count} entries")
 
         else:
             new_stbl_children.append(bytes(stbl_data[sc["offset"]:sc["end"]]))
