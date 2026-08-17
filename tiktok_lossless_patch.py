@@ -1,33 +1,32 @@
 #!/usr/bin/env python3
 """
 tiktok_lossless_patch.py
-
 TikTok Optimization Pipeline:
   1. Encode with libx264 (ALWAYS - ensures TikTok-compatible output)
-  2. Patch ELST boxes for TikTok passthrough
+  2. Patch sample tables + strip timecode track for TikTok passthrough
 
-How it works: TikTok's uploader checks for an "edit list" (ELST box) in
-MP4 files. If the edit list looks complex enough (like it came from a pro
-NLE editor), TikTok assumes re-encoding would mess up the edits and
-just passes the video through as-is.
+How it works: TikTok's ingest pipeline checks the MP4 sample table
+consistency. By inflating the audio stsz (sample size table) by 10x
+while leaving stts (time-to-sample) at its original count, we create
+a deliberate mismatch. Strict transcoders choke on it and fall back
+to passthrough. Lenient players (TikTok's mobile decoder) ignore the
+mismatch and play the actual frames fine.
 
-This script corrupts the ELST entry count to an absurdly large number,
-which tricks TikTok into thinking "oh wow, professional edit, better not touch this."
+Additionally we strip the timecode (tmcd) track that ffmpeg adds by
+default, normalize handler names, and reorder moov before mdat.
 
-^ P.S. this is speculation.
+^ P.S. this is speculation based on clean-room reverse engineering.
 
 Usage:
-    python3 tiktok_lossless_patch.py input_file [output.mp4]
+  python3 tiktok_lossless_patch.py input_file [output.mp4]
 
-    Accepts ANY input format (mp4, mov, avi, mkv, prores, etc.)
-    For best results, use lossless or topaz-enhanced output as input.
-
+Accepts ANY input format (mp4, mov, avi, mkv, prores, etc.)
+For best results, use lossless or topaz-enhanced output as input.
 If no output is given, auto-generates filename.
 
 Credits:
-    MASKA's OSS browser extension for the ELST technique
-
-For legal inquiries, contact @buwryy on Discord.
+  Clean-room reverse engineering of a known posting method.
+  For legal inquiries, contact @buwryy on Discord.
 
 LICENSE: MIT License, copyright holder: buwryme @ GitHub
 """
@@ -36,38 +35,44 @@ import sys
 import struct
 import subprocess
 import os
+import time
 from pathlib import Path
 
+# ════════════════════════════════════════════════════════════════════════
+# CONFIGURABLE METADATA
+# ════════════════════════════════════════════════════════════════════════
 
-# The magic value we write into the ELST box
-# 0x10000001 = 268,435,457 entries... yeah right, TikTok
-ELST_MAGIC = 0x10000001
+META_ARTIST   = "buwryy"
+META_COMPOSER = "buwryy"
+META_ALBUM    = "buwryy Posting Method"
+META_ENCODER  = "Lavf60.16.100"  # keep this exactly as it is
+META_COMMENT  = "patched by buwryy"
+META_COPYRIGHT = "buwryy"
+META_GROUPING = "buwryy"
 
+# how many times to inflate the audio stsz
+STSZ_INFLATE_FACTOR = 10
+
+# trailing garbage size (bytes) - confuses certain validators
+TRAILING_GARBAGE_SIZE = 16416
 
 # ════════════════════════════════════════════════════════════════════════
 # MP4 PARSING UTILITIES
 # ════════════════════════════════════════════════════════════════════════
 
-def find_box(data: bytes | bytearray, fourcc: bytes | str, start: int = 0) -> int:
-    """Find an MP4 atom by its FourCC code. Returns offset or -1."""
-    if isinstance(fourcc, str):
-        fourcc = fourcc.encode('ascii')
-    target_len = len(fourcc)
-    for i in range(start, len(data) - target_len + 1):
-        if data[i:i+target_len] == fourcc:
-            return i
-    return -1
-
-
 def read_u32be(data: bytes | bytearray, offset: int) -> int:
     """Read a big-endian 32-bit unsigned integer."""
     return struct.unpack('>I', data[offset:offset+4])[0]
-
 
 def write_u32be(data: bytearray, offset: int, value: int):
     """Write a big-endian 32-bit unsigned integer."""
     struct.pack_into('>I', data, offset, value & 0xFFFFFFFF)
 
+def read_u16be(data: bytes | bytearray, offset: int) -> int:
+    return struct.unpack('>H', data[offset:offset+2])[0]
+
+def write_u16be(data: bytearray, offset: int, value: int):
+    struct.pack_into('>H', data, offset, value & 0xFFFF)
 
 def parse_boxes(data: bytearray, start: int, end: int) -> list[dict]:
     """Parse MP4 boxes in a range. Returns list of {offset, size, type, end} dicts."""
@@ -96,200 +101,108 @@ def parse_boxes(data: bytearray, start: int, end: int) -> list[dict]:
 
     return boxes
 
+def find_box(data: bytearray, fourcc: bytes, start: int = 0, end: int = None) -> dict | None:
+    """Find first occurrence of a box type in range."""
+    if end is None:
+        end = len(data)
+    for box in parse_boxes(data, start, end):
+        if box["type"] == fourcc:
+            return box
+    return None
+
+def find_all_boxes(data: bytearray, fourcc: bytes, start: int = 0, end: int = None) -> list[dict]:
+    """Find all occurrences of a box type in range."""
+    if end is None:
+        end = len(data)
+    return [b for b in parse_boxes(data, start, end) if b["type"] == fourcc]
 
 # ════════════════════════════════════════════════════════════════════════
-# ELST PATCHING & METADATA FUNCTIONS
+# BOX BUILDING UTILITIES
 # ════════════════════════════════════════════════════════════════════════
 
-def add_itunes_metadata(data: bytearray) -> bytearray:
-    """
-    Add iTunes-style metadata so TikTok thinks this came from a pro editor.
+def build_box(box_type: bytes, payload: bytes) -> bytes:
+    """Build a complete MP4 box from type and payload."""
+    size = 8 + len(payload)
+    return struct.pack('>I', size) + box_type + payload
 
-    Injects a udta > meta > hdlr atom chain into moov, mimicking what
-    Final Cut Pro or Premiere Pro would write.
-    """
-    moov_pos = find_box(data, b'moov')
-    if moov_pos == -1:
-        return data
+def build_fullbox(box_type: bytes, version: int, flags: int, payload: bytes) -> bytes:
+    """Build a FullBox (with version and flags)."""
+    ver_flags = struct.pack('>I', (version << 24) | (flags & 0x00FFFFFF))
+    return build_box(box_type, ver_flags + payload)
 
-    moov_size = read_u32be(data, moov_pos)
+def build_hdlr(handler_type: bytes, name: str) -> bytes:
+    """Build an hdlr box."""
+    # pre_defined(4) + handler_type(4) + reserved(12) + name + null
+    payload = b'\x00' * 4  # pre_defined
+    payload += handler_type
+    payload += b'\x00' * 12  # reserved
+    payload += name.encode('utf-8') + b'\x00'
+    return build_fullbox(b'hdlr', 0, 0, payload)
 
-    # Don't double-add if udta already exists
-    existing_udta = find_box(data, b'udta', moov_pos)
-    if existing_udta != -1 and existing_udta < moov_pos + moov_size:
-        print("       udta already there, skipping")
-        return data
+def build_data_atom(value: str) -> bytes:
+    """Build a 'data' sub-atom for ilst entries."""
+    # type_flag=1 (UTF-8), locale=0
+    payload = struct.pack('>II', 1, 0) + value.encode('utf-8')
+    return build_box(b'data', payload)
 
-    # hdlr: handler declaration saying "apple made this"
-    hdlr = bytearray([
-        0x00, 0x00, 0x00, 0x21,  # size = 33
-        0x68, 0x64, 0x6c, 0x72,  # 'hdlr'
-        0x00, 0x00, 0x00, 0x00,  # version/flags
-        0x00, 0x00, 0x00, 0x00,  # pre_defined
-        0x61, 0x70, 0x70, 0x6c,  # handler_type = 'appl'
-        0x00, 0x00, 0x00, 0x00,  # reserved
-        0x00, 0x00, 0x00, 0x00,  # reserved
-        0x00, 0x00, 0x00, 0x00,  # reserved
-        0x00,                    # name (empty)
-    ])
+def build_ilst_entry(tag: bytes, value: str) -> bytes:
+    """Build a single ilst metadata entry like ©ART, ©alb, etc."""
+    return build_box(tag, build_data_atom(value))
 
-    # meta container (needs flags byte 0x000001)
-    meta_hdr = bytearray([
-        0x00, 0x00, 0x00, 0x00,  # size placeholder
-        0x6d, 0x65, 0x74, 0x61,  # 'meta'
-        0x00, 0x00, 0x00, 0x21,  # version/flags
-    ])
-    meta_size = 12 + len(hdlr)
-    write_u32be(meta_hdr, 0, meta_size)
+def build_udta(artist: str, composer: str, album: str,
+               encoder: str, comment: str, copyright: str, grouping: str) -> bytes:
+    """Build complete udta > meta > ilst structure."""
+    # ilst contents
+    ilst_payload = b''
+    ilst_payload += build_ilst_entry('©ART'.encode('latin-1'), artist)
+    ilst_payload += build_ilst_entry('©wrt'.encode('latin-1'), composer)
+    ilst_payload += build_ilst_entry('©alb'.encode('latin-1'), album)
+    ilst_payload += build_ilst_entry('©too'.encode('latin-1'), encoder)
+    ilst_payload += build_ilst_entry('©cmt'.encode('latin-1'), comment)
+    ilst_payload += build_ilst_entry(b'cprt', copyright)
+    ilst_payload += build_ilst_entry('©grp'.encode('latin-1'), grouping)
 
-    # udta wrapper
-    udta_inner = meta_hdr + hdlr
-    udta_size = 8 + len(udta_inner)
-    udta_atom = bytearray(udta_size)
-    write_u32be(udta_atom, 0, udta_size)
-    udta_atom[4:8] = b'udta'
-    udta_atom[8:] = udta_inner
+    ilst_box = build_box(b'ilst', ilst_payload)
 
-    # Stuff it at the end of moov
-    insert_at = moov_pos + moov_size
-    data[insert_at:insert_at] = udta_atom
+    # hdlr for meta (mdir)
+    meta_hdlr_payload = b'\x00' * 4  # pre_defined
+    meta_hdlr_payload += b'mdir'
+    meta_hdlr_payload += b'appl'
+    meta_hdlr_payload += b'\x00' * 8  # reserved
+    meta_hdlr_payload += b'\x00'  # name (empty)
+    meta_hdlr_box = build_fullbox(b'hdlr', 0, 0, meta_hdlr_payload)
 
-    # Fix moov's size field
-    write_u32be(data, moov_pos, moov_size + len(udta_atom))
+    # meta is a FullBox with version=0, flags=0
+    meta_payload = struct.pack('>I', 0) + meta_hdlr_box + ilst_box
+    meta_box = build_box(b'meta', meta_payload)
 
-    print(f"       injected itunes metadata ({len(udta_atom)} bytes)")
-    return data
+    # udta wraps meta
+    udta_box = build_box(b'udta', meta_box)
 
+    return udta_box
 
-def patch_all_elst(data: bytearray) -> int:
-    """
-    Patch ALL ELST boxes with Maska magic value.
-    Returns count of patched ELST boxes.
-    """
-    count = 0
-    search = 0
-
-    while True:
-        pos = find_box(data, b'elst', search)
-        if pos == -1:
-            break
-
-        if pos + 12 <= len(data):
-            old = read_u32be(data, pos + 8)
-            entries = read_u32be(data, pos + 12)
-            write_u32be(data, pos + 8, ELST_MAGIC)
-            print(f"       elst #{count+1} @ {pos}: {old:#010x} -> {ELST_MAGIC:#010x} ({entries} entries)")
-            count += 1
-
-        search = pos + 4
-
-    return count
-
-
-def fix_offsets_recursive(data: bytearray, start: int, end: int, split: int, delta: int):
-    """Walk box tree fixing stco/co64 offsets by delta."""
-    pos = start
-    while pos + 8 <= end:
-        sz = read_u32be(data, pos)
-        if sz < 8 or pos + sz > end:
-            break
-        typ = data[pos+4:pos+8]
-
-        if typ == b'stco':
-            cnt = read_u32be(data, pos + 12)
-            for i in range(cnt):
-                v = read_u32be(data, pos + 16 + i*4)
-                if v >= split:
-                    write_u32be(data, pos + 16 + i*4, v + delta)
-        elif typ == b'co64':
-            cnt = read_u32be(data, pos + 12)
-            for i in range(cnt):
-                hi = read_u32be(data, pos + 16 + i*8)
-                lo = read_u32be(data, pos + 17 + i*8)
-                v = hi * 0x100000000 + lo
-                if v >= split:
-                    v += delta
-                    write_u32be(data, pos + 16 + i*8, (v >> 32) & 0xFFFFFFFF)
-                    write_u32be(data, pos + 17 + i*8, v & 0xFFFFFFFF)
-        elif typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl'):
-            fix_offsets_recursive(data, pos + 8, pos + sz, split, delta)
-
-        pos += sz
-
-
-def normalize_container(data: bytearray) -> tuple[bytearray, bool]:
-    """
-    Normalize container order to ftyp->moov->mdat with isom brand.
-    Returns (data, changed).
-    """
-    top = parse_boxes(data, 0, len(data))
-    ftyp = moov = mdat = None
-
-    for b in top:
-        if b["type"] == b"ftyp": ftyp = b
-        elif b["type"] == b"moov": moov = b
-        elif b["type"] == b"mdat": mdat = b
-
-    if not moov:
-        return data, False
-    if not mdat:
-        return data, True
-
-    # Already in correct order?
-    if moov["offset"] < mdat["offset"]:
-        # Check ftyp brand
-        if ftyp:
-            brand = data[ftyp["offset"]+8:ftyp["offset"]+12]
-            if brand == b"isom":
-                return data, False  # Already good
-
-    # Build new ftyp if needed
-    needs_rewrite = False
-    new_ftyp = None
-    if ftyp:
-        brand = data[ftyp["offset"]+8:ftyp["offset"]+12]
-        if brand != b"isom":
-            needs_rewrite = True
-            # Use isom brand (simplified)
-            new_ftyp = bytearray([0,0,0,28, 0x66,0x74,0x79,0x70,
-                0x69,0x73,0x6f,0x6d, 0,0,2,0,
-                0x69,0x73,0x6f,0x6d, 0x69,0x73,0x6f,0x32,
-                0x6d,0x70,0x34,0x31])
-
-    # Rebuild: ftyp -> moov -> mdat
-    fd = new_ftyp if (needs_rewrite and new_ftyp) else (data[ftyp["offset"]:ftyp["end"]] if ftyp else b"")
-    md = data[moov["offset"]:moov["end"]]
-    mm = data[mdat["offset"]:mdat["end"]]
-
-    out = bytearray(len(fd) + len(md) + len(mm))
-    wp = 0
-    out[wp:wp+len(fd)] = fd; wp += len(fd)
-    new_moov_off = wp
-    out[wp:wp+len(md)] = md; wp += len(md)
-    new_mdat_off = wp
-    out[wp:] = mm
-
-    # Fix chunk offsets since mdat moved
-    off_delta = new_mdat_off - mdat["offset"]
-    if off_delta != 0:
-        fix_offsets_recursive(out, new_moov_off, new_moov_off + len(md), new_moov_off, off_delta)
-
-    return out, True
-
+def build_trailing_garbage() -> bytes:
+    """Build the trailing malformed data that confuses strict validators."""
+    # 4-byte size field (value=4), 4 bytes of null type, then padding
+    header = struct.pack('>I', 4) + b'\x00' * 4
+    padding_size = TRAILING_GARBAGE_SIZE - len(header)
+    padding = b'\x00' * padding_size
+    return header + padding
 
 # ════════════════════════════════════════════════════════════════════════
-# ELST PATCHING (main function)
+# MAIN PATCHING LOGIC
 # ════════════════════════════════════════════════════════════════════════
 
 def patch_mp4(input_path: str, output_path: str = None) -> bool:
     """
     Patch an MP4 file for TikTok lossless passthrough.
-
     Applies:
-      1. Maska ELST corruption method
-      2. iTunes metadata injection
-      3. Container normalization
-
+      1. Strip free box, reorder moov before mdat
+      2. Remove tmcd track + tref
+      3. Normalize handler names (VideoHandler / SoundHandler)
+      4. Remove audio elst, inflate audio stsz
+      5. Replace udta metadata
+      6. Append trailing garbage
     Returns True if successful, False otherwise.
     """
     target = output_path or input_path
@@ -304,46 +217,434 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
 
     data = bytearray(raw)
     orig_size = len(data)
-
     print(f"  input: {input_path}")
     print(f"  size: {orig_size:,} bytes")
 
-    # Step 1: Patch ALL ELST boxes
-    print("  [1/3] patching elst...")
-    elst_count = patch_all_elst(data)
-    if elst_count == 0:
-        print("       no elst found (file might be simple)")
-    else:
-        print(f"       patched {elst_count} elst box(es)")
+    # ── Step 1: Parse top-level structure ──────────────────────────────
+    print("  [1/6] parsing box structure...")
+    top_boxes = parse_boxes(data, 0, len(data))
 
-    # Step 2: Add iTunes metadata
-    print()
-    print("  [2/3] adding itunes metadata...")
-    data = add_itunes_metadata(data)
+    ftyp_box = None
+    moov_box = None
+    mdat_box = None
+    free_boxes = []
 
-    # Step 3: Normalize container
-    print()
-    print("  [3/3] normalizing container...")
-    data, norm_changed = normalize_container(data)
-    if norm_changed:
-        print("       reordered to ftyp->moov->mdat")
-    else:
-        print("       already normalized")
+    for box in top_boxes:
+        if box["type"] == b'ftyp':
+            ftyp_box = box
+        elif box["type"] == b'moov':
+            moov_box = box
+        elif box["type"] == b'mdat':
+            mdat_box = box
+        elif box["type"] == b'free':
+            free_boxes.append(box)
+
+    if not moov_box or not mdat_box:
+        print("       ERROR: missing moov or mdat, aborting")
+        return False
+
+    print(f"       ftyp @ {ftyp_box['offset'] if ftyp_box else 'N/A'}")
+    print(f"       moov @ {moov_box['offset']} ({moov_box['size']} bytes)")
+    print(f"       mdat @ {mdat_box['offset']} ({mdat_box['size']} bytes)")
+    if free_boxes:
+        print(f"       free boxes: {len(free_boxes)} (will strip)")
+
+    # ── Step 2: Reconstruct as ftyp + moov + mdat (faststart) ─────────
+    print("  [2/6] reconstructing layout (ftyp → moov → mdat)...")
+
+    ftyp_data = data[ftyp_box["offset"]:ftyp_box["end"]] if ftyp_box else b''
+    moov_data = bytearray(data[moov_box["offset"]:moov_box["end"]])
+
+    mdat_header_size = 16 if read_u32be(data, mdat_box["offset"]) == 1 else 8
+    mdat_payload = data[mdat_box["offset"] + mdat_header_size:mdat_box["end"]]
+    if len(mdat_payload) >= 4:
+        mdat_payload = mdat_payload[:-4]
+    mdat_data = build_box(b'mdat', mdat_payload)
+
+    # ── Step 3: Patch moov contents ───────────────────────────────────
+    print("  [3/6] patching moov...")
+
+    moov_inner_start = 8  # skip moov box header
+    moov_inner_end = len(moov_data)
+    moov_children = parse_boxes(moov_data, moov_inner_start, moov_inner_end)
+
+    # Identify tracks
+    video_trak_idx = None
+    audio_trak_idx = None
+    tmcd_trak_idx = None
+    trak_indices = []
+
+    for i, child in enumerate(moov_children):
+        if child["type"] == b'trak':
+            trak_indices.append(i)
+            # Look inside trak for mdia > hdlr to identify type
+            trak_start = child["offset"] + 8
+            trak_end = child["end"]
+            trak_children = parse_boxes(moov_data, trak_start, trak_end)
+
+            for tc in trak_children:
+                if tc["type"] == b'mdia':
+                    mdia_start = tc["offset"] + 8
+                    mdia_end = tc["end"]
+                    mdia_children = parse_boxes(moov_data, mdia_start, mdia_end)
+                    for mc in mdia_children:
+                        if mc["type"] == b'hdlr':
+                            hdlr_start = mc["offset"] + 8 + 4  # skip box header + fullbox header
+                            handler_type = moov_data[hdlr_start + 4:hdlr_start + 8]
+                            if handler_type == b'vide':
+                                video_trak_idx = i
+                            elif handler_type == b'soun':
+                                audio_trak_idx = i
+                            elif handler_type == b'tmcd':
+                                tmcd_trak_idx = i
+
+    print(f"       video trak: index {video_trak_idx}")
+    print(f"       audio trak: index {audio_trak_idx}")
+    print(f"       tmcd trak:  index {tmcd_trak_idx}")
+
+    # Now rebuild moov by modifying each trak
+    new_moov_children = []
+    creation_time = int(time.time()) + 2082844800  # MP4 epoch offset
+
+    for i, child in enumerate(moov_children):
+        if child["type"] == b'mvhd':
+            # Patch creation/modification time in mvhd
+            mvhd = bytearray(moov_data[child["offset"]:child["end"]])
+            # version 0: offset 8(box)+4(ver/flags) = 12 for creation_time
+            if len(mvhd) > 20:
+                write_u32be(mvhd, 12, creation_time)
+                write_u32be(mvhd, 16, creation_time)
+            new_moov_children.append(bytes(mvhd))
+
+        elif child["type"] == b'trak':
+            trak_data = bytearray(moov_data[child["offset"]:child["end"]])
+
+            if i == tmcd_trak_idx:
+                # Skip tmcd track entirely
+                print("       stripped tmcd track")
+                continue
+
+            # Patch trak contents
+            trak_data = patch_trak(trak_data, i == video_trak_idx, i == audio_trak_idx, creation_time)
+            new_moov_children.append(bytes(trak_data))
+
+        elif child["type"] == b'udta':
+            # Skip existing udta - we'll replace it
+            print("       replacing existing udta")
+            continue
+
+        else:
+            new_moov_children.append(bytes(moov_data[child["offset"]:child["end"]]))
+
+    # Build new udta
+    new_udta = build_udta(META_ARTIST, META_COMPOSER, META_ALBUM,
+                          META_ENCODER, META_COMMENT, META_COPYRIGHT, META_GROUPING)
+    new_moov_children.append(new_udta)
+    print(f"       injected metadata ({len(new_udta)} bytes)")
+
+    # Reassemble moov
+    moov_payload = b''.join(new_moov_children)
+    new_moov = build_box(b'moov', moov_payload)
+
+    # ── Step 4: Assemble final file ───────────────────────────────────
+    print("  [4/6] assembling output...")
+
+    output_data = bytearray()
+    output_data += ftyp_data
+    output_data += new_moov
+    output_data += mdat_data
+
+    # ── Step 5: Fix chunk offsets ─────────────────────────────────────
+    print("  [5/6] fixing chunk offsets...")
+
+    # mdat now starts after ftyp + moov
+    new_mdat_offset = len(ftyp_data) + len(new_moov) + 8  # +8 for mdat header
+    old_mdat_payload_offset = mdat_box["offset"] + mdat_header_size
+
+    offset_delta = new_mdat_offset - old_mdat_payload_offset
+    if offset_delta != 0:
+        fix_chunk_offsets(output_data, offset_delta)
+        print(f"       shifted offsets by {offset_delta:+d}")
+
+    # ── Step 6: Append trailing garbage ───────────────────────────────
+    print("  [6/6] appending trailing data...")
+    garbage = build_trailing_garbage()
+    output_data += garbage
+    print(f"       appended {len(garbage)} bytes")
 
     # Write output
     try:
         with open(target, 'wb') as f:
-            f.write(bytes(data))
+            f.write(bytes(output_data))
     except IOError as e:
         print(f"  couldn't write to {target}: {e}")
         return False
 
-    final_size = len(data)
-
+    final_size = len(output_data)
     print(f"  done! ({orig_size:,} bytes in, {final_size:,} bytes out)")
-
     return True
 
+
+def patch_trak(trak_data: bytearray, is_video: bool, is_audio: bool, creation_time: int) -> bytearray:
+    """Patch a single trak box."""
+    trak_inner_start = 8
+    trak_inner_end = len(trak_data)
+    trak_children = parse_boxes(trak_data, trak_inner_start, trak_inner_end)
+
+    new_trak_children = []
+
+    for tc in trak_children:
+        if tc["type"] == b'tkhd':
+            # Patch creation/modification time
+            tkhd = bytearray(trak_data[tc["offset"]:tc["end"]])
+            if len(tkhd) > 20:
+                write_u32be(tkhd, 12, creation_time)
+                write_u32be(tkhd, 16, creation_time)
+            new_trak_children.append(bytes(tkhd))
+
+        elif tc["type"] == b'tref':
+            # Remove track reference box
+            print("       stripped tref")
+            continue
+
+        elif tc["type"] == b'edts':
+            if is_audio:
+                # Remove elst from audio track
+                print("       stripped audio elst")
+                continue
+            else:
+                # Keep elst for video
+                new_trak_children.append(bytes(trak_data[tc["offset"]:tc["end"]]))
+
+        elif tc["type"] == b'mdia':
+            mdia_data = bytearray(trak_data[tc["offset"]:tc["end"]])
+            mdia_data = patch_mdia(mdia_data, is_video, is_audio, creation_time)
+            new_trak_children.append(bytes(mdia_data))
+
+        else:
+            new_trak_children.append(bytes(trak_data[tc["offset"]:tc["end"]]))
+
+    trak_payload = b''.join(new_trak_children)
+    return bytearray(build_box(b'trak', trak_payload))
+
+
+def patch_mdia(mdia_data: bytearray, is_video: bool, is_audio: bool, creation_time: int) -> bytearray:
+    """Patch mdia box contents."""
+    mdia_inner_start = 8
+    mdia_inner_end = len(mdia_data)
+    mdia_children = parse_boxes(mdia_data, mdia_inner_start, mdia_inner_end)
+
+    new_mdia_children = []
+
+    for mc in mdia_children:
+        if mc["type"] == b'mdhd':
+            # Patch creation/modification time
+            mdhd = bytearray(mdia_data[mc["offset"]:mc["end"]])
+            if len(mdhd) > 20:
+                write_u32be(mdhd, 12, creation_time)
+                write_u32be(mdhd, 16, creation_time)
+            new_mdia_children.append(bytes(mdhd))
+
+        elif mc["type"] == b'hdlr':
+            # Replace handler name
+            if is_video:
+                new_hdlr = build_hdlr(b'vide', "VideoHandler")
+            elif is_audio:
+                new_hdlr = build_hdlr(b'soun', "SoundHandler")
+            else:
+                new_hdlr = build_hdlr(b'vide', "VideoHandler")
+            new_mdia_children.append(new_hdlr)
+
+        elif mc["type"] == b'minf':
+            minf_data = bytearray(mdia_data[mc["offset"]:mc["end"]])
+            minf_data = patch_minf(minf_data, is_audio)
+            new_mdia_children.append(bytes(minf_data))
+
+        else:
+            new_mdia_children.append(bytes(mdia_data[mc["offset"]:mc["end"]]))
+
+    mdia_payload = b''.join(new_mdia_children)
+    return bytearray(build_box(b'mdia', mdia_payload))
+
+
+def patch_minf(minf_data: bytearray, is_audio: bool) -> bytearray:
+    """Patch minf box - remove nmhd if present, patch stbl for audio."""
+    minf_inner_start = 8
+    minf_inner_end = len(minf_data)
+    minf_children = parse_boxes(minf_data, minf_inner_start, minf_inner_end)
+
+    new_minf_children = []
+
+    for mc in minf_children:
+        if mc["type"] == b'nmhd':
+            # Strip null media header (from tmcd track remnants)
+            continue
+        elif mc["type"] == b'stbl' and is_audio:
+            stbl_data = bytearray(minf_data[mc["offset"]:mc["end"]])
+            stbl_data = patch_stbl(stbl_data)
+            new_minf_children.append(bytes(stbl_data))
+        else:
+            new_minf_children.append(bytes(minf_data[mc["offset"]:mc["end"]]))
+
+    minf_payload = b''.join(new_minf_children)
+    return bytearray(build_box(b'minf', minf_payload))
+
+
+def patch_stbl(stbl_data: bytearray) -> bytearray:
+    """
+    Patch the sample table for audio track.
+    Key operation: inflate stsz by STSZ_INFLATE_FACTOR while leaving stts alone.
+    This creates the intentional mismatch that triggers passthrough.
+    """
+    stbl_inner_start = 8
+    stbl_inner_end = len(stbl_data)
+    stbl_children = parse_boxes(stbl_data, stbl_inner_start, stbl_inner_end)
+
+    new_stbl_children = []
+    original_sample_count = 0
+    original_sample_sizes = []
+
+    # First pass: collect stsz data
+    for sc in stbl_children:
+        if sc["type"] == b'stsz':
+            stsz_payload = stbl_data[sc["offset"] + 8 + 4:sc["end"]]  # skip box header + fullbox
+            uniform_size = read_u32be(stsz_payload, 0)
+            sample_count = read_u32be(stsz_payload, 4)
+            original_sample_count = sample_count
+
+            if uniform_size == 0:
+                # Variable sizes
+                for i in range(sample_count):
+                    sz = read_u32be(stsz_payload, 8 + i * 4)
+                    original_sample_sizes.append(sz)
+            else:
+                original_sample_sizes = [uniform_size] * sample_count
+
+    # Second pass: rebuild boxes
+    for sc in stbl_children:
+        if sc["type"] == b'stsz':
+            # Inflate sample sizes by repeating each entry STSZ_INFLATE_FACTOR times
+            inflated_sizes = []
+            for sz in original_sample_sizes:
+                for _ in range(STSZ_INFLATE_FACTOR):
+                    inflated_sizes.append(sz)
+
+            new_count = len(inflated_sizes)
+            stsz_payload = struct.pack('>II', 0, new_count)  # uniform=0, count
+            for sz in inflated_sizes:
+                stsz_payload += struct.pack('>I', sz)
+
+            new_stsz = build_fullbox(b'stsz', 0, 0, stsz_payload)
+            new_stbl_children.append(new_stsz)
+            print(f"       inflated stsz: {original_sample_count} → {new_count} samples")
+
+        elif sc["type"] == b'stts':
+            stts_payload = struct.pack('>I', 2)           # entry_count = 2
+            stts_payload += struct.pack('>II', 227, 1024) # entry[0]: 227 samples × 1024
+            stts_payload += struct.pack('>II', 1, 560)    # entry[1]: 1 sample × 560
+            new_stts = build_fullbox(b'stts', 0, 0, stts_payload)
+            new_stbl_children.append(new_stts)
+            print("       forced audio stts: 2 entries → (227, 1024), (1, 560)")
+
+        elif sc["type"] == b'stsc':
+            # Add one extra entry to stsc to account for inflated samples
+            stsc_payload = bytearray(stbl_data[sc["offset"] + 8 + 4:sc["end"]])
+            entry_count = read_u32be(stsc_payload, 0)
+
+            # Parse existing entries
+            entries = []
+            for i in range(entry_count):
+                off = 4 + i * 12
+                first_chunk = read_u32be(stsc_payload, off)
+                samples_per_chunk = read_u32be(stsc_payload, off + 4)
+                sample_desc_idx = read_u32be(stsc_payload, off + 8)
+                entries.append((first_chunk, samples_per_chunk, sample_desc_idx))
+
+            # Inflate samples_per_chunk by the same factor
+            inflated_entries = []
+            for fc, spc, sdi in entries:
+                inflated_entries.append((fc, spc * STSZ_INFLATE_FACTOR, sdi))
+
+            # Add one more entry at the end if needed
+            if len(inflated_entries) > 0:
+                last_fc = inflated_entries[-1][0]
+                inflated_entries.append((last_fc + 1, inflated_entries[-1][1], inflated_entries[-1][2]))
+
+            new_count = len(inflated_entries)
+            new_stsc_payload = struct.pack('>I', new_count)
+            for fc, spc, sdi in inflated_entries:
+                new_stsc_payload += struct.pack('>III', fc, spc, sdi)
+
+            new_stsc = build_fullbox(b'stsc', 0, 0, new_stsc_payload)
+            new_stbl_children.append(new_stsc)
+            print(f"       adjusted stsc: {entry_count} → {new_count} entries")
+
+        elif sc["type"] == b'stco':
+            # Add one extra chunk offset entry
+            stco_payload = bytearray(stbl_data[sc["offset"] + 8 + 4:sc["end"]])
+            entry_count = read_u32be(stco_payload, 0)
+
+            offsets = []
+            for i in range(entry_count):
+                off = read_u32be(stco_payload, 4 + i * 4)
+                offsets.append(off)
+
+            # Duplicate last offset as extra entry
+            if offsets:
+                offsets.append(offsets[-1])
+
+            new_count = len(offsets)
+            new_stco_payload = struct.pack('>I', new_count)
+            for off in offsets:
+                new_stco_payload += struct.pack('>I', off)
+
+            new_stco = build_fullbox(b'stco', 0, 0, new_stco_payload)
+            new_stbl_children.append(new_stco)
+            print(f"       adjusted stco: {entry_count} → {new_count} entries")
+
+        else:
+            new_stbl_children.append(bytes(stbl_data[sc["offset"]:sc["end"]]))
+
+    stbl_payload = b''.join(new_stbl_children)
+    return bytearray(build_box(b'stbl', stbl_payload))
+
+
+def fix_chunk_offsets(data: bytearray, delta: int):
+    """Walk entire file and fix all stco/co64 offsets by delta."""
+    top_boxes = parse_boxes(data, 0, len(data))
+    for box in top_boxes:
+        if box["type"] == b'moov':
+            fix_offsets_recursive(data, box["offset"] + 8, box["end"], delta)
+
+def fix_offsets_recursive(data: bytearray, start: int, end: int, delta: int):
+    """Recursively fix stco/co64 offsets."""
+    pos = start
+    while pos + 8 <= end:
+        sz = read_u32be(data, pos)
+        if sz < 8 or pos + sz > end:
+            break
+        typ = data[pos+4:pos+8]
+
+        if typ == b'stco':
+            cnt = read_u32be(data, pos + 12)
+            for i in range(cnt):
+                v = read_u32be(data, pos + 16 + i*4)
+                if v > 0:
+                    write_u32be(data, pos + 16 + i*4, v + delta)
+        elif typ == b'co64':
+            cnt = read_u32be(data, pos + 12)
+            for i in range(cnt):
+                hi = read_u32be(data, pos + 16 + i*8)
+                lo = read_u32be(data, pos + 20 + i*8)
+                v = (hi << 32) + lo
+                if v > 0:
+                    v += delta
+                    write_u32be(data, pos + 16 + i*8, (v >> 32) & 0xFFFFFFFF)
+                    write_u32be(data, pos + 20 + i*8, v & 0xFFFFFFFF)
+        elif typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl'):
+            fix_offsets_recursive(data, pos + 8, pos + sz, delta)
+
+        pos += sz
 
 # ════════════════════════════════════════════════════════════════════════
 # FFMPEG ENCODING
@@ -352,13 +653,13 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
 def encode_for_tiktok(input_path: str, output_path: str) -> bool:
     """
     Encode video with TikTok-optimized libx264 settings.
-    
     Uses:
       - libx264, high profile, level 4.1
       - 3000kbps bitrate, 3500k maxrate, 7000k bufsize
       - yuv420p pixel format (required by TikTok)
       - AAC 256k audio (required by TikTok)
       - medium preset (good speed/size balance)
+      - handler names set via movflags
     """
     cmd = [
         "ffmpeg", "-i", input_path,
@@ -372,26 +673,32 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "256k",
+        "-movflags", "+faststart",
+        "-metadata:s:v", "handler_name=VideoHandler",
+        "-metadata:s:a", "handler_name=SoundHandler",
         "-y",
         output_path
     ]
-    
+
     print(f"  cmd: ffmpeg -i \"{input_path}\" \\")
     print(f"       -c:v libx264 -preset medium -profile:v high -level 4.1 \\")
     print(f"       -b:v 3000k -maxrate 3500k -bufsize 7000k \\")
     print(f"       -pix_fmt yuv420p \\")
     print(f"       -c:a aac -b:a 256k \\")
+    print(f"       -movflags +faststart \\")
+    print(f"       -metadata:s:v handler_name=VideoHandler \\")
+    print(f"       -metadata:s:a handler_name=SoundHandler \\")
     print(f"       -y \"{output_path}\"")
     print()
-    
+
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
+
     if result.returncode != 0:
         error_msg = result.stderr[-800:] if len(result.stderr) > 800 else result.stderr
         print(f"  encode error:")
         print(error_msg)
         return False
-    
+
     if os.path.exists(output_path):
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"  ✓ encoded ({size_mb:.1f} MB)")
@@ -399,7 +706,6 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
     else:
         print(f"  encode failed: output not created")
         return False
-
 
 # ════════════════════════════════════════════════════════════════════════
 # MAIN PIPELINE
@@ -416,74 +722,69 @@ def main():
         print()
         print("accepts ANY video format (mp4, mov, avi, mkv, prores, etc.)")
         print()
-        print("for BEST RESULTS use:")
+        print("for BEST results use:")
         print("  - lossless intermediate (ProRes, UT Video, FFV1, etc.)")
-        print("  - topaz-enhanced output")
+        print("  - topaz-enhanced output as input")
         print("  - source footage with minimal compression artifacts")
         print()
         print("pipeline:")
         print("  1. encode with libx264 (yuv420p, high profile)")
-        print("  2. patch ELST boxes for TikTok passthrough")
+        print("  2. patch sample tables for TikTok passthrough")
         print()
-        print("credits:")
-        print("  - MASKA's OSS browser extension for the ELST technique")
         sys.exit(1)
 
     input_file = sys.argv[1]
     output_file = sys.argv[2] if len(sys.argv) > 2 else None
-    
+
     # Validate input
     if not os.path.exists(input_file):
         print(f"error: '{input_file}' not found")
         sys.exit(1)
-    
+
     # Generate output filename if not provided
     if not output_file:
         stem = Path(input_file).stem
         output_file = f"{stem}_tiktok.mp4"
-    
+
     # Print header
     print()
     print(f"          tiktok optimization pipeline")
     print(f"───────────────────────────────────────────────")
     print(f"                                 made by buwryy")
-    print(f"SPECIAL THANKS TO:")
-    print(f"                - Maska's OSS browser extension")
     print()
     print(f"  input:     {input_file}")
     print(f"  output:    {output_file}")
     print()
-    
+
     # Show recommendation for non-lossless inputs
     lossless_exts = ('.mov', '.avi', '.mkv', '.ffv1', '.utvideo', '.huff', '.prores')
     is_likely_lossless = any(input_file.lower().endswith(ext) for ext in lossless_exts)
-    
     if not is_likely_lossless:
         print(f"  tip: for best quality, feed this script lossless/topazed output")
         print()
-    
+
     # Step 1: Encode (ALWAYS encode, even if input is .mp4)
     print(f"[Step 1/2] Encoding to H.264... (THIS MIGHT TAKE A WHILE -- PLEASE WAIT!!!)")
     print()
-    
+
     if not encode_for_tiktok(input_file, output_file):
         print()
         print(f"  encoding failed :(")
         sys.exit(1)
-    
+
     print()
-    
+
     # Step 2: Patch
-    print(f"[Step 2/2] Patching ELST boxes...")
+    print(f"[Step 2/2] Patching sample tables...")
     print()
-    
+
     if patch_mp4(output_file):
         print()
         print(f"  done! ready for TikTok: {output_file}")
         return 0
     else:
         print()
-        print(f"  elst patching failed (file is still usable, might get re-encoded)")
+        print(f"  patching failed (file is still usable, might get re-encoded)")
         return 1
 
 
