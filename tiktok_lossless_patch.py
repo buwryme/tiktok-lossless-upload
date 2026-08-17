@@ -2,7 +2,7 @@
 """
 tiktok_lossless_patch.py
 TikTok Optimization Pipeline:
-  1. Encode with libx264 (ALWAYS - ensures TikTok-compatible output)
+  1. Encode with libx265/HEVC Main 10 (CPU) - supports up to 4K60fps
   2. Patch sample tables + strip timecode track for TikTok passthrough
 
 How it works: TikTok's ingest pipeline checks the MP4 sample table
@@ -14,6 +14,8 @@ mismatch and play the actual frames fine.
 
 Additionally we strip the timecode (tmcd) track that ffmpeg adds by
 default, normalize handler names, and reorder moov before mdat.
+
+Supports up to 4K resolution at 60fps.
 
 ^ P.S. this is speculation based on clean-room reverse engineering.
 
@@ -777,25 +779,25 @@ def fix_offsets_recursive(data: bytearray, start: int, end: int, delta: int):
 
 def encode_for_tiktok(input_path: str, output_path: str) -> bool:
     """
-    Encode video with TikTok-optimized libx264 settings.
+    Encode video with TikTok-optimized libx265 settings.
     Uses:
-      - libx264, high profile, level 4.1
-      - 3000kbps bitrate, 3500k maxrate, 7000k bufsize
-      - yuv420p pixel format (required by TikTok)
-      - AAC 256k audio (required by TikTok)
+      - libx265, main 10 profile, 
+      - 1500kbps bitrate, 20000k maxrate, 40000k bufsize
+      - yuv420p10le pixel format
+      - AAC 256k audio (best for TikTok)
       - medium preset (good speed/size balance)
       - handler names set via movflags
     """
+
     cmd = [
         "ffmpeg", "-i", input_path,
-        "-c:v", "libx264",
+        "-c:v", "libx265",
         "-preset", "medium",
-        "-profile:v", "high",
-        "-level", "4.1",
-        "-b:v", "3000k",
-        "-maxrate", "3500k",
-        "-bufsize", "7000k",
-        "-pix_fmt", "yuv420p",
+        "-profile:v", "main10",
+        "-b:v", "15000k",
+        "-maxrate", "20000k",
+        "-bufsize", "40000k",
+        "-pix_fmt", "yuv420p10le",
         "-c:a", "aac",
         "-b:a", "256k",
         "-movflags", "+faststart",
@@ -806,15 +808,14 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
     ]
 
     print(f"  cmd: ffmpeg -i \"{input_path}\" \\")
-    print(f"       -c:v libx264 -preset medium -profile:v high -level 4.1 \\")
-    print(f"       -b:v 3000k -maxrate 3500k -bufsize 7000k \\")
-    print(f"       -pix_fmt yuv420p \\")
+    print(f"       -c:v libx265 -preset medium -profile:v main10 \\")
+    print(f"       -b:v 15000k -maxrate 20000k -bufsize 40000k \\")
+    print(f"       -pix_fmt yuv420p10le \\")
     print(f"       -c:a aac -b:a 256k \\")
     print(f"       -movflags +faststart \\")
     print(f"       -metadata:s:v handler_name=VideoHandler \\")
     print(f"       -metadata:s:a handler_name=SoundHandler \\")
     print(f"       -y \"{output_path}\"")
-    print()
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -853,7 +854,7 @@ def main():
         print("  - source footage with minimal compression artifacts")
         print()
         print("pipeline:")
-        print("  1. encode with libx264 (yuv420p, high profile)")
+        print("  1. encode with libx265 (yuv420ple, main 10 profile)")
         print("  2. patch sample tables for TikTok passthrough")
         print()
         sys.exit(1)
@@ -876,6 +877,7 @@ def main():
     print(f"          tiktok optimization pipeline")
     print(f"───────────────────────────────────────────────")
     print(f"                                 made by buwryy")
+    print(f"                (supports up to 4k res, 60fps!)")
     print()
     print(f"  input:     {input_file}")
     print(f"  output:    {output_file}")
@@ -889,7 +891,7 @@ def main():
         print()
 
     # Step 1: Encode (ALWAYS encode, even if input is .mp4)
-    print(f"[Step 1/2] Encoding to H.264... (THIS MIGHT TAKE A WHILE -- PLEASE WAIT!!!)")
+    print(f"[Step 1/2] Encoding to H.265... (THIS MIGHT TAKE A WHILE -- PLEASE WAIT!!!)")
     print()
 
     if not encode_for_tiktok(input_file, output_file):
