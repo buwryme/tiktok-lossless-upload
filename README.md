@@ -1,41 +1,87 @@
-# Video Patcher for TikTok to allow lossless uploading.
-Patch your videos to upload them to TikTok without TikTok re-encoding them (lossless), but now fully open source.
 
-### Why?
+<div align="center">
 
-Methods like itzcrih's on-website video patching or Editing News' extensions are highly credible for being functional, BUT:
-- They are closed source.
-- Their processing is done on their servers, which raises privacy concerns.
+# TikTok Lossless Upload Patcher
 
-This simple project brings lossless uploading into an open source manner.
+**Bypass TikTok's server-side re-encoding and upload videos losslessly.**  
+Fully open-source, local-only, and privacy-respecting alternative to closed-source web or browser extension patchers.
 
-### Usage:
-#### Requirements:
-- Python 3.6+. No pip packages required.
+[![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-Required-green?style=flat-square&logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-Working%20as%20of%20Aug%202026-brightgreen?style=flat-square)]()
 
-```py
-# Patch in place (would output to video_tiktok.mp4)
+</div>
+
+---
+
+## Why?
+
+Existing tools like itzcrih's web patcher or Editing News' browser extensions are effective but come with significant drawbacks:
+
+- **Closed source** — you cannot audit what they do to your files
+- **Server-side processing** — your video is uploaded to a third-party server before being patched, raising serious privacy concerns
+- **Proprietary watermarks** — some tools inject their own branding into your content
+
+This project brings lossless uploading into the open, runs entirely on your machine, and lets you control your own metadata.
+
+---
+
+## Requirements
+
+| Dependency | Minimum Version | Notes |
+|---|---|---|
+| Python | 3.10+ | Uses PEP 604 union type syntax (`X \| Y`) |
+| FFmpeg | Any recent build | Must be available on system `$PATH` |
+| Browser | Firefox-based | Firefox, Zen Browser, Librefox... (see note below) |
+
+> ⚠️ **Browser Compatibility:** Chromium/Chrome-based browsers fail to generate cover thumbnails due to how they parse the manipulated sample tables, which grays out the Post button. Safari/iOS is untested.
+> **ALWAYS POST ON FIREFOX-BASED BROWSERS!**
+
+---
+
+## Usage
+
+### Basic Patching
+
+```bash
+# Patch in place (outputs to video_tiktok.mp4)
 python3 tiktok_lossless_patch.py video.mp4
 
-# Or save to new file
+# Specify a custom output filename
 python3 tiktok_lossless_patch.py input.mp4 output.mp4
 ```
 
-After patching, upload the result into TikTok via any Chrome-based browser on **desktop**. No extra steps from here.
+### Mobile Workaround
 
-For mobile, using Microsoft Edge & going into Desktop Mode and proceeding to upload it into TikTok might do. (Might not work on iOS!)
+On Android, use **Firefox in Desktop Mode** (or any Gecko browser) to upload. This is likely to work, but is not guaranteed. iOS is currently untested and likely unsupported, due to Apple enforcing WebKit on every browser
 
-### How it works
-- Encodes your input video into H264 with specific criteria (level 4.1, yuv420p, high profile, aac 256k, specific bitrate values...)
-- Inflates ELST boxes from 0x1 to 0x10000001 (thanks to MASKA's extension!)
+---
 
-### ⚠️ Disclaimer
-- Published **strictly** for educational purposes.
-- TikTok may patch this at anytime. (Works as of *August 13th, 2026*)
-- Additionally to what's said above, I may choose to not update this repo to keep up with their patches.
-- Works only on Chrome-based browsers (Gecko/Firefox fails to process the cover due to ELST entry count patching, which makes the Post button grayed out. Webkit/Safari/iOS untested!)
+## How It Works
 
-### Special Thanks
-- MASKA's OSS browser extension for ELST box inflation technique
+TikTok's ingest pipeline checks MP4 sample table consistency to decide whether to re-encode. This tool exploits that check through coordinated container-level manipulations:
 
-> For legal inquiries, contact @buwryy on Discord.
+1. **Encodes** input to H.264 High Profile Level 4.1, yuv420p, AAC-LC 256kbps with bitrate values tuned to TikTok's expected ranges
+2. **Inflates** the audio `stsz` (sample size) table by repeating entries 10×, creating a deliberate mismatch between declared and actual sample counts
+3. **Rewrites** the audio `stts` (time-to-sample) table with specific entry values that maintain apparent duration while reinforcing the inconsistency
+4. **Strips** timecode tracks (`tmcd`) and track references (`tref`) that can trigger re-encoding
+5. **Injects** custom metadata under `moov/udta/meta/ilst` so you retain attribution without third-party watermarks
+
+The result is a file that strict transcoders reject (falling back to passthrough) while lenient players like TikTok's mobile decoder handle normally.
+
+---
+
+## ⚠️ Disclaimer
+
+- Published **strictly for educational and research purposes**.
+- TikTok may patch this at any time. **Works as of August 2026.**
+- The author may choose not to update this repository if TikTok changes their ingest pipeline.
+- Always test with non-critical content first. Results may vary by account, region, and client version.
+- Respect TikTok's Terms of Service. Use responsibly.
+
+<div align="center">
+
+**For legal/general inquiries about this repo, contact [@buwryy](https://discord.com) on Discord.**
+
+</div>
