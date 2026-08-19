@@ -10,6 +10,7 @@ Fully open-source, local-only, and privacy-respecting alternative to closed-sour
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-Required-green?style=flat-square&logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Working%20as%20of%20Aug%202026-brightgreen?style=flat-square)]()
+[![GTK4](https://img.shields.io/badge/GTK4-GUI-orange?style=flat-square&logo=gnome&logoColor=white)]()
 
 </div>
 
@@ -54,6 +55,8 @@ python3 tiktok_lossless_patch.py input.mp4 output.mp4
 
 On Android, use **Firefox in Desktop Mode** (or any Gecko browser) to upload. This is likely to work, but is not guaranteed. iOS is currently untested and likely unsupported, due to Apple enforcing WebKit on every browser
 
+
+
 ### A note about 120 FPS / 4K...
 
 It's best to post your video as 1080p60 at most. Higher resolutions may get re-encoded by TikTok. (still technically possible!)
@@ -71,6 +74,21 @@ TikTok's ingest pipeline checks MP4 sample table consistency to decide whether t
 5. **Injects** custom metadata under `moov/udta/meta/ilst` so you retain attribution without third-party watermarks (feel free to change the configurable metadata inside the script)
 
 The result is a file that strict transcoders reject (falling back to passthrough) while lenient players like TikTok's mobile decoder handle normally.
+
+## 🖥️ GTK4 GUI
+
+Prefer a graphical interface? A native GTK4 frontend is included for graphical usage.
+
+> ⚠️ **Important:** You must run this from the same directory as `tiktok_lossless_patch.py`. The GUI imports the patcher as a local module and will fail if launched from elsewhere.
+
+```bash
+cd /path/to/tiktok-lossless-patcher
+python3 app.py
+```
+
+**GUI Requirements:**
+- `PyGObject` (GTK4 bindings) — install via `pip install PyGObject` or your system package manager (`libgtk-4-dev`, `gobject-introspection`)
+- All base requirements from the table above still apply
 
 ---
 
