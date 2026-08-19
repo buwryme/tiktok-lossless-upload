@@ -59,6 +59,65 @@ STSZ_INFLATE_FACTOR = 10
 TRAILING_GARBAGE_SIZE = 16416
 
 # ════════════════════════════════════════════════════════════════════════
+# WRAPPER FUNCTIONS FOR UI INTEGRATION (APP.PY)
+# ════════════════════════════════════════════════════════════════════════
+
+def get_default_config() -> dict:
+    """Return default configuration parameters for GUI."""
+    return {
+        "artist": META_ARTIST,
+        "composer": META_COMPOSER,
+        "album": META_ALBUM,
+        "encoder": META_ENCODER,
+        "comment": META_COMMENT,
+        "copyright": META_COPYRIGHT,
+        "grouping": META_GROUPING,
+        "inflation_rate": STSZ_INFLATE_FACTOR,
+        "trailing_bytes": TRAILING_GARBAGE_SIZE,
+        "re_encode": True
+    }
+
+def patch_video(input_path: str, config: dict = None) -> bool:
+    """
+    Main entry point for app.py to patch a video file.
+    Applies config options (if given) and runs encoding/patching pipeline.
+    """
+    global META_ARTIST, META_COMPOSER, META_ALBUM, META_ENCODER
+    global META_COMMENT, META_COPYRIGHT, META_GROUPING
+    global STSZ_INFLATE_FACTOR, TRAILING_GARBAGE_SIZE
+
+    if config:
+        META_ARTIST = config.get("artist", META_ARTIST)
+        META_COMPOSER = config.get("composer", META_COMPOSER)
+        META_ALBUM = config.get("album", META_ALBUM)
+        META_ENCODER = config.get("encoder", META_ENCODER)
+        META_COMMENT = config.get("comment", META_COMMENT)
+        META_COPYRIGHT = config.get("copyright", META_COPYRIGHT)
+        META_GROUPING = config.get("grouping", META_GROUPING)
+        STSZ_INFLATE_FACTOR = config.get("inflation_rate", STSZ_INFLATE_FACTOR)
+        TRAILING_GARBAGE_SIZE = config.get("trailing_bytes", TRAILING_GARBAGE_SIZE)
+        re_encode = config.get("re_encode", True)
+    else:
+        re_encode = True
+
+    p = Path(input_path)
+    output_path = str(p.parent / f"{p.stem}_tiktok.mp4")
+
+    # Step 1: Encode video if enabled
+    if re_encode:
+        if not encode_for_tiktok(input_path, output_path):
+            raise RuntimeError("Encoding failed during execution")
+        target_file = output_path
+    else:
+        target_file = input_path
+
+    # Step 2: Patch video structure
+    if not patch_mp4(target_file):
+        raise RuntimeError("Patching MP4 structure failed")
+
+    return True
+
+# ════════════════════════════════════════════════════════════════════════
 # MP4 PARSING UTILITIES
 # ════════════════════════════════════════════════════════════════════════
 
@@ -782,7 +841,7 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
     Encode video with TikTok-optimized libx265 settings.
     Uses:
       - libx265, main 10 profile, 
-      - 1500kbps bitrate, 20000k maxrate, 40000k bufsize
+      - 15000kbps bitrate, 20000k maxrate, 40000k bufsize
       - yuv420p10le pixel format
       - AAC 256k audio (best for TikTok)
       - medium preset (good speed/size balance)
