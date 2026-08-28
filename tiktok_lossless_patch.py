@@ -7,11 +7,10 @@ import os
 import time
 from pathlib import Path
 
-# Change these
 META_ARTIST   = "uploadmeth: buwryy"
 META_COMPOSER = "uploadmeth: buwryy"
 META_ALBUM    = "uploadmeth: buwryy"
-META_ENCODER  = "Lavf60.16.100" # best to keep this as-is
+META_ENCODER  = "Lavf60.16.100"
 META_COMMENT  = "uploadmeth: buwryy"
 META_COPYRIGHT = "uploadmeth: buwryy"
 META_GROUPING = "uploadmeth: buwryy"
@@ -230,11 +229,9 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
     video_trak_idx = None
     audio_trak_idx = None
     tmcd_trak_idx = None
-    trak_indices = []
 
     for i, child in enumerate(moov_children):
         if child["type"] == b'trak':
-            trak_indices.append(i)
             trak_start = child["offset"] + 8
             trak_end = child["end"]
             trak_children = parse_boxes(moov_data, trak_start, trak_end)
@@ -277,8 +274,21 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
                 print("       stripped tmcd track")
                 continue
 
-            trak_data = patch_trak(trak_data, i == video_trak_idx, i == audio_trak_idx, creation_time)
-            new_moov_children.append(bytes(trak_data))
+            is_audio = (i == audio_trak_idx)
+            is_video = (i == video_trak_idx)
+
+            if is_audio:
+                primary = patch_trak(trak_data, is_video, is_audio, creation_time, inflate=False)
+                new_moov_children.append(bytes(primary))
+
+                print("       duplicating audio track for inflation...")
+                clone = bytearray(trak_data)
+                clone_patched = patch_trak(clone, False, True, creation_time, inflate=True)
+                new_moov_children.append(bytes(clone_patched))
+                print("       appended inflated audio clone after primary")
+            else:
+                patched = patch_trak(trak_data, is_video, is_audio, creation_time, inflate=False)
+                new_moov_children.append(bytes(patched))
 
         elif child["type"] == b'udta':
             print("       replacing existing udta")
@@ -329,7 +339,8 @@ def patch_mp4(input_path: str, output_path: str = None) -> bool:
     return True
 
 
-def patch_trak(trak_data: bytearray, is_video: bool, is_audio: bool, creation_time: int) -> bytearray:
+def patch_trak(trak_data: bytearray, is_video: bool, is_audio: bool,
+               creation_time: int, inflate: bool = False) -> bytearray:
     trak_inner_start = 8
     trak_inner_end = len(trak_data)
     trak_children = parse_boxes(trak_data, trak_inner_start, trak_inner_end)
@@ -349,15 +360,15 @@ def patch_trak(trak_data: bytearray, is_video: bool, is_audio: bool, creation_ti
             continue
 
         elif tc["type"] == b'edts':
-            if is_audio:
-                print("       stripped audio elst")
+            if is_audio or is_video:
+                print(f"       stripped {'audio' if is_audio else 'video'} elst")
                 continue
             else:
                 new_trak_children.append(bytes(trak_data[tc["offset"]:tc["end"]]))
 
         elif tc["type"] == b'mdia':
             mdia_data = bytearray(trak_data[tc["offset"]:tc["end"]])
-            mdia_data = patch_mdia(mdia_data, is_video, is_audio, creation_time)
+            mdia_data = patch_mdia(mdia_data, is_video, is_audio, creation_time, inflate)
             new_trak_children.append(bytes(mdia_data))
 
         else:
@@ -367,7 +378,8 @@ def patch_trak(trak_data: bytearray, is_video: bool, is_audio: bool, creation_ti
     return bytearray(build_box(b'trak', trak_payload))
 
 
-def patch_mdia(mdia_data: bytearray, is_video: bool, is_audio: bool, creation_time: int) -> bytearray:
+def patch_mdia(mdia_data: bytearray, is_video: bool, is_audio: bool,
+               creation_time: int, inflate: bool = False) -> bytearray:
     mdia_inner_start = 8
     mdia_inner_end = len(mdia_data)
     mdia_children = parse_boxes(mdia_data, mdia_inner_start, mdia_inner_end)
@@ -384,16 +396,16 @@ def patch_mdia(mdia_data: bytearray, is_video: bool, is_audio: bool, creation_ti
 
         elif mc["type"] == b'hdlr':
             if is_video:
-                new_hdlr = build_hdlr(b'vide', "VideoHandler")
+                new_hdlr = build_hdlr(b'vide', "")
             elif is_audio:
-                new_hdlr = build_hdlr(b'soun', "SoundHandler")
+                new_hdlr = build_hdlr(b'soun', "")
             else:
-                new_hdlr = build_hdlr(b'vide', "VideoHandler")
+                new_hdlr = build_hdlr(b'vide', "")
             new_mdia_children.append(new_hdlr)
 
         elif mc["type"] == b'minf':
             minf_data = bytearray(mdia_data[mc["offset"]:mc["end"]])
-            minf_data = patch_minf(minf_data, is_audio)
+            minf_data = patch_minf(minf_data, is_audio, inflate)
             new_mdia_children.append(bytes(minf_data))
 
         else:
@@ -403,7 +415,7 @@ def patch_mdia(mdia_data: bytearray, is_video: bool, is_audio: bool, creation_ti
     return bytearray(build_box(b'mdia', mdia_payload))
 
 
-def patch_minf(minf_data: bytearray, is_audio: bool) -> bytearray:
+def patch_minf(minf_data: bytearray, is_audio: bool, inflate: bool = False) -> bytearray:
     minf_inner_start = 8
     minf_inner_end = len(minf_data)
     minf_children = parse_boxes(minf_data, minf_inner_start, minf_inner_end)
@@ -414,9 +426,12 @@ def patch_minf(minf_data: bytearray, is_audio: bool) -> bytearray:
         if mc["type"] == b'nmhd':
             continue
         elif mc["type"] == b'stbl' and is_audio:
-            stbl_data = bytearray(minf_data[mc["offset"]:mc["end"]])
-            stbl_data = patch_stbl(stbl_data)
-            new_minf_children.append(bytes(stbl_data))
+            if inflate:
+                stbl_data = bytearray(minf_data[mc["offset"]:mc["end"]])
+                stbl_data = patch_stbl(stbl_data)
+                new_minf_children.append(bytes(stbl_data))
+            else:
+                new_minf_children.append(bytes(minf_data[mc["offset"]:mc["end"]]))
         else:
             new_minf_children.append(bytes(minf_data[mc["offset"]:mc["end"]]))
 
@@ -555,20 +570,20 @@ def patch_stbl(stbl_data: bytearray) -> bytearray:
 
     new_stsz = build_fullbox(b'stsz', 0, 0, new_stsz_payload)
 
-    print(f"       \033[1mstsz\033[0m: {real_count} → {new_count} samples (real-first tail)")
+    print(f"       \033[1mstsz\033[0m (clone): {real_count} → {new_count} samples")
 
-    if real_count == 228:
-        stts_payload = struct.pack('>I', 2)
-        stts_payload += struct.pack('>II', 227, 1024)
-        stts_payload += struct.pack('>II', 1, 560)
+    orig_stts_pay = stbl_data[stts_box["offset"] + 12:stts_box["end"]]
+    orig_entry_count = read_u32be(orig_stts_pay, 0) if len(orig_stts_pay) >= 4 else 0
 
-        new_stts = build_fullbox(b'stts', 0, 0, stts_payload)
-
-        print("       forced audio stts: 2 entries → (227, 1024), (1, 560)")
+    if extra_count > 0:
+        ext_payload = struct.pack('>I', orig_entry_count + 1)
+        ext_payload += orig_stts_pay[4:]
+        ext_payload += struct.pack('>II', extra_count, 1)
+        new_stts = build_fullbox(b'stts', 0, 0, ext_payload)
+        print(f"       \033[1mstts\033[0m (clone): {orig_entry_count} → {orig_entry_count + 1} entries (+({extra_count}, 1))")
     else:
         new_stts = bytes(stbl_data[stts_box["offset"]:stts_box["end"]])
-
-        print("       preserved original audio stts")
+        print("       preserved original audio stts (clone)")
 
     new_stsc_entries = list(stsc_entries)
 
@@ -586,7 +601,7 @@ def patch_stbl(stbl_data: bytearray) -> bytearray:
 
     new_stsc = build_fullbox(b'stsc', 0, 0, new_stsc_payload)
 
-    print(f"       \033[1mstsc\033[0m: {stsc_entry_count} → {len(new_stsc_entries)} entries (tail chunk)")
+    print(f"       \033[1mstsc\033[0m (clone): {stsc_entry_count} → {len(new_stsc_entries)} entries")
 
     new_stco_offsets = list(stco_offsets)
 
@@ -600,7 +615,7 @@ def patch_stbl(stbl_data: bytearray) -> bytearray:
 
     new_stco = build_fullbox(b'stco', 0, 0, new_stco_payload)
 
-    print(f"       \033[1mstco\033[0m: {stco_entry_count} → {len(new_stco_offsets)} offsets (tail chunk)")
+    print(f"       \033[1mstco\033[0m (clone): {stco_entry_count} → {len(new_stco_offsets)} offsets")
 
     new_stbl_children = []
 
@@ -670,8 +685,8 @@ def encode_for_tiktok(input_path: str, output_path: str) -> bool:
         "-c:a", "aac",
         "-b:a", "256k",
         "-movflags", "+faststart",
-        "-metadata:s:v", "handler_name=VideoHandler",
-        "-metadata:s:a", "handler_name=SoundHandler",
+        "-metadata:s:v", "handler_name=",
+        "-metadata:s:a", "handler_name=",
         "-y",
         output_path
     ]
