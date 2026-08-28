@@ -20,8 +20,6 @@ bypasses tiktok server-side re-encoding, so your uploads stay uncompressed and a
 ```bash
 python3 tiktok_lossless_patch.py input.mp4 [output.mp4]
 ```
-> [!IMPORTANT]
-> the sound won't show up inside the interface & the review will take ~10 minutes compared to regular 1 minute. however, you and other people will still hear the audio. this is completely normal.
 
 encodes to **h.264 crf 18** (visually lossless) + patches container structure to force passthrough.
 
