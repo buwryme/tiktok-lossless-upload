@@ -22,7 +22,7 @@ python3 tiktok_patch.py input.mp4 [output.mp4]
 
 encodes to **h.264 crf 18** (visually lossless) + patches container structure to force passthrough.
 
-> **tip:** supports up to 4K@60FPS.
+> **tip:** supports *any* video resolution, but up to 1080p60fps is best
 
 ### custom metadata
 
