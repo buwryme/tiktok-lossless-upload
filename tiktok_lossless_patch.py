@@ -11,6 +11,17 @@ import subprocess
 import os
 from pathlib import Path
 
+# codec-aware dummy sample sizes from NoBlur
+CODEC_DUMMY_SIZES = {
+    b'avc1': 8,
+    b'avc3': 8,
+    b'hvc1': 16,
+    b'hev1': 16,
+    b'vp09': 4,
+    b'av01': 4,
+    b'mp4v': 8,
+}
+
 # default settings
 DEFAULTS = {
     "title": "",
@@ -49,6 +60,14 @@ def write_u32be(data: bytearray, offset: int, value: int):
     struct.pack_into('>I', data, offset, value & 0xFFFFFFFF)
 
 
+def read_u64be(data: bytes | bytearray, offset: int) -> int:
+    return struct.unpack('>Q', data[offset:offset+8])[0]
+
+
+def write_u64be(data: bytearray, offset: int, value: int):
+    struct.pack_into('>Q', data, offset, value & 0xFFFFFFFFFFFFFFFF)
+
+
 def parse_boxes(data: bytearray, start: int, end: int) -> list[dict]:
     boxes = []
     pos = start
@@ -66,7 +85,7 @@ def parse_boxes(data: bytearray, start: int, end: int) -> list[dict]:
         if size < 8 or pos + size > end:
             break
         atype = data[pos+4:pos+8]
-        boxes.append({"offset": pos, "size": size, "type": atype, "end": pos + size})
+        boxes.append({"offset": pos, "size": size, "type": bytes(atype), "end": pos + size})
         pos += size
     return boxes
 
@@ -160,6 +179,41 @@ def build_trailing_garbage(size: int) -> bytes:
     return void_box + (pattern * repeats)
 
 
+def detect_video_codec(data: bytearray) -> bytes:
+    """detect video codec fourcc from first video sample entry in stsd"""
+    moov = find_box(data, b'moov')
+    if not moov:
+        return b'avc1'
+    for trak in parse_boxes(data, moov["offset"] + 8, moov["end"]):
+        if trak["type"] != b'trak':
+            continue
+        for mdia in parse_boxes(data, trak["offset"] + 8, trak["end"]):
+            if mdia["type"] != b'mdia':
+                continue
+            is_video = False
+            for child in parse_boxes(data, mdia["offset"] + 8, mdia["end"]):
+                if child["type"] == b'hdlr':
+                    ht = data[child["offset"]+16:child["offset"]+20]
+                    if ht == b'vide':
+                        is_video = True
+                    break
+            if not is_video:
+                continue
+            for minf in parse_boxes(data, mdia["offset"] + 8, mdia["end"]):
+                if minf["type"] != b'minf':
+                    continue
+                for stbl in parse_boxes(data, minf["offset"] + 8, minf["end"]):
+                    if stbl["type"] != b'stbl':
+                        continue
+                    for stsd in parse_boxes(data, stbl["offset"] + 8, stbl["end"]):
+                        if stsd["type"] != b'stsd':
+                            continue
+                        entries = parse_boxes(data, stsd["offset"] + 8, stsd["end"])
+                        if entries:
+                            return entries[0]["type"]
+    return b'avc1'
+
+
 def zero_mp4a_samplerate(data: bytearray):
     top_boxes = parse_boxes(data, 0, len(data))
     moov = next((b for b in top_boxes if b["type"] == b'moov'), None)
@@ -182,6 +236,83 @@ def _zero_mp4a_recursive(data: bytearray, start: int, end: int):
         pos += sz
 
 
+def spoof_audio_bitrate(data: bytearray, source_path: str):
+    """copy esds avgBitrate/maxBitrate and mp4a-btrt from source to all target mp4a entries"""
+    try:
+        with open(source_path, 'rb') as f:
+            src = bytearray(f.read())
+    except IOError:
+        return
+
+    src_moov = find_box(src, b'moov')
+    if not src_moov:
+        return
+
+    src_bitrates = []
+    _extract_mp4a_bitrates(src, src_moov["offset"] + 8, src_moov["end"], src_bitrates)
+    if not src_bitrates:
+        return
+    src_avg, src_max = src_bitrates[0]
+
+    tgt_moov = find_box(data, b'moov')
+    if not tgt_moov:
+        return
+    _apply_mp4a_bitrates(data, tgt_moov["offset"] + 8, tgt_moov["end"], src_avg, src_max)
+
+
+def _extract_mp4a_bitrates(data: bytearray, start: int, end: int, results: list):
+    pos = start
+    while pos + 8 <= end:
+        sz = read_u32be(data, pos)
+        if sz < 8 or pos + sz > end:
+            break
+        typ = data[pos+4:pos+8]
+        if typ == b'mp4a' and sz >= 36:
+            cpos = pos + 36
+            while cpos + 8 <= pos + sz:
+                csz = read_u32be(data, cpos)
+                if csz < 8 or cpos + csz > pos + sz:
+                    break
+                ctyp = data[cpos+4:cpos+8]
+                if ctyp == b'esds' and csz >= 30:
+                    max_br = read_u32be(data, cpos + 22)
+                    avg_br = read_u32be(data, cpos + 26)
+                    results.append((avg_br, max_br))
+                cpos += csz
+        elif typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl', b'stsd'):
+            _extract_mp4a_bitrates(data, pos + 8, pos + sz, results)
+        pos += sz
+
+
+def _apply_mp4a_bitrates(data: bytearray, start: int, end: int, avg: int, mx: int) -> int:
+    count = 0
+    pos = start
+    while pos + 8 <= end:
+        sz = read_u32be(data, pos)
+        if sz < 8 or pos + sz > end:
+            break
+        typ = data[pos+4:pos+8]
+        if typ == b'mp4a' and sz >= 36:
+            cpos = pos + 36
+            while cpos + 8 <= pos + sz:
+                csz = read_u32be(data, cpos)
+                if csz < 8 or cpos + csz > pos + sz:
+                    break
+                ctyp = data[cpos+4:cpos+8]
+                if ctyp == b'esds' and csz >= 30:
+                    write_u32be(data, cpos + 22, mx)
+                    write_u32be(data, cpos + 26, avg)
+                    count += 1
+                elif ctyp == b'btrt' and csz >= 20:
+                    write_u32be(data, cpos + 12, avg)
+                    write_u32be(data, cpos + 16, mx)
+                cpos += csz
+        elif typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl', b'stsd'):
+            count += _apply_mp4a_bitrates(data, pos + 8, pos + sz, avg, mx)
+        pos += sz
+    return count
+
+
 def copy_avcc_from_source(source_path: str, target_data: bytearray) -> bytearray:
     try:
         with open(source_path, 'rb') as f:
@@ -194,13 +325,12 @@ def copy_avcc_from_source(source_path: str, target_data: bytearray) -> bytearray
     if not src_moov or not tgt_moov:
         return target_data
 
-    src_avcc = find_box(src, b'avcC', src_moov["offset"], src_moov["end"])
-    tgt_avcc = find_box(target_data, b'avcC', tgt_moov["offset"], tgt_moov["end"])
-    if not src_avcc or not tgt_avcc:
-        return target_data
+    for cfg_box in (b'avcC', b'hvcC'):
+        src_cfg = find_box(src, cfg_box, src_moov["offset"], src_moov["end"])
+        tgt_cfg = find_box(target_data, cfg_box, tgt_moov["offset"], tgt_moov["end"])
+        if src_cfg and tgt_cfg and src_cfg["size"] == tgt_cfg["size"]:
+            target_data[tgt_cfg["offset"]:tgt_cfg["end"]] = src[src_cfg["offset"]:src_cfg["end"]]
 
-    if src_avcc["size"] == tgt_avcc["size"]:
-        target_data[tgt_avcc["offset"]:tgt_avcc["end"]] = src[src_avcc["offset"]:src_avcc["end"]]
     return target_data
 
 
@@ -238,6 +368,46 @@ def strip_free_boxes(data: bytearray) -> bytearray:
     return result
 
 
+def upgrade_mvhd_to_v1(mvhd: bytearray) -> bytearray:
+    """convert mvhd to version 1 with unknown duration and nexttrackid=5"""
+    ver = mvhd[8]
+    timescale = read_u32be(mvhd, 20) if ver == 0 else read_u32be(mvhd, 28)
+    ntid_off = 96 if ver == 0 else 108
+    ntid = read_u32be(mvhd, ntid_off)
+
+    body = bytearray(112)
+    body[0] = 1
+    struct.pack_into('>I', body, 20, timescale)
+    struct.pack_into('>Q', body, 24, 0xFFFFFFFFFFFFFFFF)
+    struct.pack_into('>I', body, 32, 0x00010000)
+    struct.pack_into('>H', body, 36, 0x0100)
+    struct.pack_into('>I', body, 44, 0x00010000)
+    struct.pack_into('>I', body, 60, 0x00010000)
+    struct.pack_into('>I', body, 76, 0x40000000)
+    struct.pack_into('>I', body, 108, 5)
+
+    return bytearray(build_box(b'mvhd', bytes(body)))
+
+
+def patch_elst_plus_one(edts_data: bytearray) -> bytearray:
+    """increment first elst segment_duration by 1 tick"""
+    children = parse_boxes(edts_data, 8, len(edts_data))
+    new_children = []
+    for c in children:
+        if c["type"] == b'elst':
+            elst = bytearray(edts_data[c["offset"]:c["end"]])
+            ver = elst[8]
+            count = read_u32be(elst, 12)
+            if count > 0:
+                dur_off = 16 if ver == 0 else 20
+                dur = read_u32be(elst, dur_off)
+                write_u32be(elst, dur_off, dur + 1)
+            new_children.append(bytes(elst))
+        else:
+            new_children.append(bytes(edts_data[c["offset"]:c["end"]]))
+    return bytearray(build_box(b'edts', b''.join(new_children)))
+
+
 def patch_video(input_path: str, config: dict = None) -> bool:
     cfg = get_config(config)
     p = Path(input_path)
@@ -271,6 +441,13 @@ def patch_mp4(input_path: str, cfg: dict, source_path: str = None) -> bool:
 
     if source_path and not cfg.get("re_encode", True):
         data = copy_avcc_from_source(source_path, data)
+
+    # detect video codec and set appropriate dummy size
+    video_codec = detect_video_codec(data)
+    global STSZ_INFLATE_FACTOR, DUMMY_SAMPLE_SIZE
+    STSZ_INFLATE_FACTOR = cfg.get("inflation_rate", DEFAULTS["inflation_rate"])
+    DUMMY_SAMPLE_SIZE = CODEC_DUMMY_SIZES.get(video_codec, 8)
+    print(f"       \033[1mcodec\033[0m: {video_codec.decode('ascii', errors='replace')} (dummy={DUMMY_SAMPLE_SIZE})")
 
     print("       \033[1m[1/7]\033[0m parsing box structure...")
     top_boxes = parse_boxes(data, 0, len(data))
@@ -314,26 +491,24 @@ def patch_mp4(input_path: str, cfg: dict, source_path: str = None) -> bool:
     for i, child in enumerate(moov_children):
         if child["type"] == b'mvhd':
             mvhd = bytearray(moov_data[child["offset"]:child["end"]])
-            write_u32be(mvhd, 12, 0)
-            write_u32be(mvhd, 16, 0)
-            version = mvhd[8]
-            ntid_offset = 96 if version == 0 else 108
-            write_u32be(mvhd, ntid_offset, 4)
+            mvhd = upgrade_mvhd_to_v1(mvhd)
             new_moov_children.append(bytes(mvhd))
         elif child["type"] == b'trak':
             trak_data = bytearray(moov_data[child["offset"]:child["end"]])
-            if i == tmcd_trak_idx:
-                continue
+            is_tmcd = (i == tmcd_trak_idx)
             is_audio = (i == audio_trak_idx)
             is_video = (i == video_trak_idx)
             if is_audio:
-                primary = patch_trak(trak_data, is_video, True, inflate=False, track_id=2)
+                primary = patch_trak(trak_data, is_video, True, inflate=False, track_id=2, is_clone=False)
                 new_moov_children.append(bytes(primary))
                 clone = bytearray(trak_data)
-                clone_patched = patch_trak(clone, False, True, inflate=True, track_id=3)
+                clone_patched = patch_trak(clone, False, True, inflate=True, track_id=4, is_clone=True)
                 new_moov_children.append(bytes(clone_patched))
+            elif is_tmcd:
+                patched = patch_trak(trak_data, False, False, inflate=False, track_id=3, is_clone=False)
+                new_moov_children.append(bytes(patched))
             else:
-                patched = patch_trak(trak_data, is_video, False, inflate=False)
+                patched = patch_trak(trak_data, is_video, False, inflate=False, track_id=1, is_clone=False)
                 new_moov_children.append(bytes(patched))
         elif child["type"] == b'udta':
             continue
@@ -359,6 +534,7 @@ def patch_mp4(input_path: str, cfg: dict, source_path: str = None) -> bool:
     print("       \033[1m[6/7]\033[0m post-patch fixes...")
     zero_mp4a_samplerate(output_data)
     if source_path:
+        spoof_audio_bitrate(output_data, source_path)
         fix_btrt_from_source(source_path, output_data)
     output_data = strip_free_boxes(output_data)
 
@@ -379,22 +555,37 @@ def patch_mp4(input_path: str, cfg: dict, source_path: str = None) -> bool:
 
 
 def patch_trak(trak_data: bytearray, is_video: bool, is_audio: bool,
-               inflate: bool = False, track_id: int = 0) -> bytearray:
+               inflate: bool = False, track_id: int = 0, is_clone: bool = False) -> bytearray:
     trak_children = parse_boxes(trak_data, 8, len(trak_data))
     new_children = []
 
     for tc in trak_children:
         if tc["type"] == b'tkhd':
             tkhd = bytearray(trak_data[tc["offset"]:tc["end"]])
-            write_u32be(tkhd, 12, 0)
-            write_u32be(tkhd, 16, 0)
+            ver = tkhd[8]
+            if ver == 0:
+                write_u32be(tkhd, 12, 0)
+                write_u32be(tkhd, 16, 0)
+            else:
+                write_u64be(tkhd, 12, 0)
+                write_u64be(tkhd, 20, 0)
             if track_id > 0:
-                write_u32be(tkhd, 20, track_id)
+                tid_off = 20 if ver == 0 else 28
+                write_u32be(tkhd, tid_off, track_id)
             new_children.append(bytes(tkhd))
         elif tc["type"] == b'tref':
-            continue
+            if is_clone:
+                continue
+            new_children.append(bytes(trak_data[tc["offset"]:tc["end"]]))
         elif tc["type"] == b'edts':
-            continue
+            if is_clone:
+                continue
+            if is_video:
+                edts_data = bytearray(trak_data[tc["offset"]:tc["end"]])
+                edts_data = patch_elst_plus_one(edts_data)
+                new_children.append(bytes(edts_data))
+            else:
+                new_children.append(bytes(trak_data[tc["offset"]:tc["end"]]))
         elif tc["type"] == b'mdia':
             mdia_data = bytearray(trak_data[tc["offset"]:tc["end"]])
             mdia_data = patch_mdia(mdia_data, is_video, is_audio, inflate)
@@ -413,8 +604,13 @@ def patch_mdia(mdia_data: bytearray, is_video: bool, is_audio: bool,
     for mc in mdia_children:
         if mc["type"] == b'mdhd':
             mdhd = bytearray(mdia_data[mc["offset"]:mc["end"]])
-            write_u32be(mdhd, 12, 0)
-            write_u32be(mdhd, 16, 0)
+            ver = mdhd[8]
+            if ver == 0:
+                write_u32be(mdhd, 12, 0)
+                write_u32be(mdhd, 16, 0)
+            else:
+                write_u64be(mdhd, 12, 0)
+                write_u64be(mdhd, 20, 0)
             new_children.append(bytes(mdhd))
         elif mc["type"] == b'hdlr':
             if is_video:
@@ -541,7 +737,7 @@ def patch_stbl(stbl_data: bytearray) -> bytearray:
     for sz in new_sizes:
         new_stsz_payload += struct.pack('>I', sz)
     new_stsz = build_fullbox(b'stsz', 0, 0, new_stsz_payload)
-    print(f"       \033[1mstsz\033[0m (clone): {real_count} → {new_count}")
+    print(f"       \033[1mstsz\033[0m (clone): {real_count} → {new_count} (dummy={dummy_size})")
 
     orig_stts_pay = stbl_data[stts_box["offset"] + 12:stts_box["end"]]
     orig_tc = read_u32be(orig_stts_pay, 0) if len(orig_stts_pay) >= 4 else 0
@@ -604,7 +800,7 @@ def fix_offsets_recursive(data: bytearray, start: int, end: int, delta: int):
                     v += delta
                     write_u32be(data, pos + 16 + i*8, (v >> 32) & 0xFFFFFFFF)
                     write_u32be(data, pos + 20 + i*8, v & 0xFFFFFFFF)
-        elif typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl'):
+        elif typ in (b'moov', b'trak', b'media', b'minf', b'stbl'):
             fix_offsets_recursive(data, pos + 8, pos + sz, delta)
         pos += sz
 
