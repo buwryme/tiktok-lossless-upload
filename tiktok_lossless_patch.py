@@ -800,7 +800,7 @@ def fix_offsets_recursive(data: bytearray, start: int, end: int, delta: int):
                     v += delta
                     write_u32be(data, pos + 16 + i*8, (v >> 32) & 0xFFFFFFFF)
                     write_u32be(data, pos + 20 + i*8, v & 0xFFFFFFFF)
-        elif typ in (b'moov', b'trak', b'media', b'minf', b'stbl'):
+        elif typ in (b'moov', b'trak', b'mdia', b'minf', b'stbl'):
             fix_offsets_recursive(data, pos + 8, pos + sz, delta)
         pos += sz
 
