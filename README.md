@@ -5,6 +5,7 @@
 bypasses tiktok server-side re-encoding, so your uploads stay uncompressed and as-is.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Patcher Status](https://img.shields.io/badge/patcher-active-green?style=flat-square)](#how-it-works)
 
 </div>
 
@@ -61,7 +62,5 @@ check out [tikutils](https://github.com/buwryme/tikutils) for an installable app
 tiktok's transcoders choke on the structural mismatch and skip re-encoding. mobile decoders ignore the dummy track and play normally.
 
 ---
-
-> works as of sep 2026. use at your own risk.
 
 for inquiries contact **@buwryy** on discord
