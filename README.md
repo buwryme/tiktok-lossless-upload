@@ -5,7 +5,7 @@
 bypasses tiktok server-side re-encoding, so your uploads stay uncompressed and as-is.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Patcher Status](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbuwryme%2Fbuwryy.net%2Fmain%2F.github%2Fpatcher-status.json&style=flat-square)](https://github.com/buwryme/buwryy.net)
+![Patcher Status](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbuwryme%2Fbuwryy.net%2Fmain%2F.github%2Fpatcher-status.json&style=flat-square)
 
 </div>
 
