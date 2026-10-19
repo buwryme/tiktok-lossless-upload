@@ -45,16 +45,16 @@ check out [tikutils](https://github.com/buwryme/tikutils) for an installable app
 ## how it works
 
 1.  encodes or remuxes video/audio with optimized ffmpeg settings.
-2.  removes all `udta` metadata and writes one `©too` watermark.
-3.  rebuilds the video sample table with codec-sized dummy samples and updates `stts`, `stsc`, `stsz`, and `stco`.
-4.  rewrites the `btrt` bitrate fields from the real sample sizes.
-5.  moves `moov` before `mdat` (faststart) and appends the dummy sample payload.
+2.  duplicates the audio track and inflates its `stsz` table with dummy samples.
+3.  removes all `udta` metadata and writes the project metadata back.
+4.  fixes chunk offsets and normalizes the container layout.
+5.  appends the trailing dummy payload to the end of the file.
 
-tiktok's transcoders choke on the structural mismatch and skip re-encoding. mobile decoders ignore the dummy samples and play normally.
+tiktok's transcoders choke on the structural mismatch and skip re-encoding. mobile decoders ignore the dummy track and play normally.
 
 ## configuration
 
-patcher tuning (sample multiplier, dummy sample sizes and payloads for every codec, watermark, and layout flags) is fetched from a public `.toml` gist. if the fetch fails, the built-in copy is used. encode settings remain available in the gui and cli.
+patcher tuning (inflation rate, codec-specific dummy sizes, metadata, and trailing payload) is fetched from a public `.toml` gist. if the fetch fails, the built-in copy is used. encode settings remain available in the gui and cli.
 
 ---
 
