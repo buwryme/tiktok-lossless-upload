@@ -11,6 +11,8 @@ bypasses tiktok server-side re-encoding, so your uploads stay uncompressed and a
 
 ---
 
+Reverse engineered from Editing News' patcher and made open source.
+
 ## requirements
 - python 3.10+
 - ffmpeg (in `$PATH`)
@@ -18,28 +20,17 @@ bypasses tiktok server-side re-encoding, so your uploads stay uncompressed and a
 ## usage
 
 ```bash
-python3 tiktok_patch.py input.mp4 [output.mp4]
+python3 tiktok_lossless_patch.py input.mp4 [output.mp4]
 ```
 
-encodes to **h.264 crf 18** (visually lossless) + patches container structure to force passthrough.
+encodes to **h.264 crf 18** (visually lossless) + patches the container structure to force passthrough.
+
+```bash
+python3 tiktok_lossless_patch.py input.mp4 --no-reencode
+python3 tiktok_lossless_patch.py input.mp4 --codec h265 --crf 18
+```
 
 > **tip:** supports *any* video resolution, but up to 1080p60fps is best
-
-### custom metadata
-
-override defaults via the `patch_video()` api:
-
-```python
-from tiktok_patch import patch_video
-
-patch_video("input.mp4", {
-    "comment": "my custom tag",
-    "name_box_payload": "anything-here",
-    "inflation_rate": 9,
-})
-```
-
-all fields (`encoder`, `comment`, `comment_short`, `name_box_payload`, `inflation_rate`, `dummy_sample_size`, `trailing_bytes`) are configurable.
 
 ## gui
 
@@ -53,13 +44,17 @@ check out [tikutils](https://github.com/buwryme/tikutils) for an installable app
 
 ## how it works
 
-1.  encodes video/audio with optimized ffmpeg settings.
-2.  duplicates audio track and inflates its `stsz` table with constant-size dummy samples.
-3.  strips `tmcd`/`tref` tracks and normalizes handler names.
-4.  injects dual `meta` boxes with custom metadata and an unknown `name` box.
-5.  appends a `VOID` box and repeating trailing pattern bytes.
+1.  encodes or remuxes video/audio with optimized ffmpeg settings.
+2.  removes all `udta` metadata and writes one `©too` watermark.
+3.  rebuilds the video sample table with codec-sized dummy samples and updates `stts`, `stsc`, `stsz`, and `stco`.
+4.  rewrites the `btrt` bitrate fields from the real sample sizes.
+5.  moves `moov` before `mdat` (faststart) and appends the dummy sample payload.
 
-tiktok's transcoders choke on the structural mismatch and skip re-encoding. mobile decoders ignore the dummy track and play normally.
+tiktok's transcoders choke on the structural mismatch and skip re-encoding. mobile decoders ignore the dummy samples and play normally.
+
+## configuration
+
+patcher tuning (sample multiplier, dummy sample sizes and payloads for every codec, watermark, and layout flags) is fetched from a public `.toml` gist. if the fetch fails, the built-in copy is used. encode settings remain available in the gui and cli.
 
 ---
 

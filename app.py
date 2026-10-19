@@ -40,18 +40,7 @@ except Exception as e:
         pass
 
     def get_default_config():
-        return {
-            "artist": "buwryy",
-            "composer": "buwryy",
-            "album": "buwryy",
-            "encoder": "buwryy",
-            "comment": "buwryy",
-            "copyright": "buwryy",
-            "grouping": "buwryy",
-            "inflation_rate": 10,
-            "trailing_bytes": 1024,
-            "re_encode": False
-        }
+        return {"re_encode": True, "crf": 18, "codec": "h264"}
 
 CONFIG_PATH = Path.home() / ".config" / "tiktok_patcher.json"
 
@@ -65,15 +54,18 @@ class ConfigManager:
             try:
                 with open(CONFIG_PATH, 'r') as f:
                     saved = json.load(f)
-                    self.config.update(saved)
+                for key, value in saved.items():
+                    if key in self.config:
+                        self.config[key] = value
             except Exception:
                 pass
 
     def save(self, new_config):
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        filtered = {k: v for k, v in new_config.items() if k in self.config}
         with open(CONFIG_PATH, 'w') as f:
-            json.dump(new_config, f, indent=2)
-        self.config = new_config
+            json.dump(filtered, f, indent=2)
+        self.config = filtered
 
 
 class PreferencesView(Adw.NavigationPage):
@@ -105,77 +97,22 @@ class PreferencesView(Adw.NavigationPage):
         prefs_page = Adw.PreferencesPage()
         prefs_page.set_icon_name("preferences-system-symbolic")
 
-        # iTunes Metadata Group
-        metadata_group = Adw.PreferencesGroup()
-        metadata_group.set_title("iTunes Metadata (udta)")
-        metadata_group.set_description("Metadata to embed in the video file")
-
-        self.entries = {}
-        fields = [
-            ("artist", "Artist"),
-            ("composer", "Composer"),
-            ("album", "Album"),
-            ("encoder", "Encoder"),
-            ("comment", "Comment"),
-            ("copyright", "Copyright"),
-            ("grouping", "Grouping")
-        ]
-
-        for key, label in fields:
-            row = Adw.ActionRow()
-            row.set_title(label)
-
-            entry = Gtk.Entry()
-            entry.set_valign(Gtk.Align.CENTER)
-            entry.set_text(config_manager.config.get(key, "buwryy"))
-            entry.connect("changed", self.on_field_changed)
-            row.add_suffix(entry)
-            row.set_activatable_widget(entry)
-
-            self.entries[key] = entry
-            metadata_group.add(row)
-
-        prefs_page.add(metadata_group)
 
         # Patching Options Group
         patch_group = Adw.PreferencesGroup()
         patch_group.set_title("Patching Options")
         patch_group.set_description("Control how the video is patched")
 
-        # Inflation Rate
-        inflation_row = Adw.ActionRow()
-        inflation_row.set_title("Inflation Rate")
-        inflation_row.set_subtitle("Percentage of size increase for padding")
 
-        self.inflation_spin = Gtk.SpinButton.new_with_range(1, 100, 1)
-        self.inflation_spin.set_valign(Gtk.Align.CENTER)
-        self.inflation_spin.set_value(config_manager.config.get("inflation_rate", 10))
-        self.inflation_spin.connect("value-changed", self.on_field_changed)
-        inflation_row.add_suffix(self.inflation_spin)
-        inflation_row.set_activatable_widget(self.inflation_spin)
-        patch_group.add(inflation_row)
-
-        # Trailing Bytes
-        trailing_row = Adw.ActionRow()
-        trailing_row.set_title("Trailing Dummy Bytes")
-        trailing_row.set_subtitle("Amount of bytes to add at the end")
-
-        self.trailing_spin = Gtk.SpinButton.new_with_range(0, 1000000, 100)
-        self.trailing_spin.set_valign(Gtk.Align.CENTER)
-        self.trailing_spin.set_value(config_manager.config.get("trailing_bytes", 1024))
-        self.trailing_spin.connect("value-changed", self.on_field_changed)
-        trailing_row.add_suffix(self.trailing_spin)
-        trailing_row.set_activatable_widget(self.trailing_spin)
-        patch_group.add(trailing_row)
 
         # Re-encode Toggle
         reencode_row = Adw.ActionRow()
         reencode_row.set_title("Re-encode Video")
-        reencode_row.set_subtitle("Re-encode video to HEVC")
+        reencode_row.set_subtitle("Re-encode video before patching")
 
         self.reencode_switch = Gtk.Switch()
         self.reencode_switch.set_valign(Gtk.Align.CENTER)
-        self.reencode_switch.set_active(config_manager.config.get("re_encode", False))
+        self.reencode_switch.set_active(config_manager.config.get("re_encode", True))
         self.reencode_switch.connect("notify::active", self.on_field_changed)
         reencode_row.add_suffix(self.reencode_switch)
         reencode_row.set_activatable_widget(self.reencode_switch)
@@ -224,18 +161,9 @@ class PreferencesView(Adw.NavigationPage):
         self.save_button.set_sensitive(False)
 
     def get_current_config(self):
-        return {
-            "artist": self.entries["artist"].get_text(),
-            "composer": self.entries["composer"].get_text(),
-            "album": self.entries["album"].get_text(),
-            "encoder": self.entries["encoder"].get_text(),
-            "comment": self.entries["comment"].get_text(),
-            "copyright": self.entries["copyright"].get_text(),
-            "grouping": self.entries["grouping"].get_text(),
-            "inflation_rate": int(self.inflation_spin.get_value()),
-            "trailing_bytes": int(self.trailing_spin.get_value()),
-            "re_encode": self.reencode_switch.get_active()
-        }
+        cfg = self.config_manager.config.copy()
+        cfg["re_encode"] = self.reencode_switch.get_active()
+        return cfg
 
 
 class SelectArea(Gtk.Box):
