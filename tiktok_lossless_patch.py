@@ -402,8 +402,137 @@ def _patch_btrt_in_stsd(stsd, bitrate):
     return bytes(data)
 
 
-def _rebuild_stbl(stbl, delta, safe_offset, video, stats):
+def _read_descriptor_length(data, pos):
+    value = 0
+    while pos < len(data):
+        byte = data[pos]
+        pos += 1
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            break
+    return value, pos
+
+
+def _patch_audio_stsd(stsd, bitrate):
+    data = bytearray(stsd)
+    pos = 0
+    while True:
+        pos = data.find(b"esds", pos)
+        if pos < 0:
+            break
+        start = pos - 4
+        size = _u32(data, start) if start >= 0 else 0
+        if size >= 30:
+            cursor = start + 12  # box header + fullbox version/flags
+            if cursor < start + size and data[cursor] == 0x03:
+                cursor += 1
+                _, cursor = _read_descriptor_length(data, cursor)
+                cursor += 3  # ES_ID (2) + flags (1)
+                if cursor < start + size and data[cursor] == 0x04:
+                    cursor += 1
+                    _, cursor = _read_descriptor_length(data, cursor)
+                    max_offset = cursor + 5  # object type + stream type + buffer size
+                    avg_offset = max_offset + 4
+                    if avg_offset + 4 <= start + size:
+                        data[max_offset:max_offset + 4] = _p32(bitrate)
+                        data[avg_offset:avg_offset + 4] = _p32(bitrate)
+        pos += 4
+
+    pos = 0
+    while True:
+        pos = data.find(b"btrt", pos)
+        if pos < 0:
+            break
+        start = pos - 4
+        if start >= 0 and _u32(data, start) == 20:
+            data[start + 12:start + 16] = _p32(bitrate)
+            data[start + 16:start + 20] = _p32(bitrate)
+        pos += 4
+    return bytes(data)
+
+
+def _patch_tkhd_duration(tkhd, duration):
+    payload = bytearray(tkhd["payload"])
+    if payload[0] == 1:
+        payload[28:36] = _p64(duration)
+    else:
+        payload[20:24] = _p32(duration)
+    return _box(b"tkhd", bytes(payload))
+
+
+def _build_stts_entries(entries):
+    payload = _p32(0) + _p32(len(entries))
+    for count, delta in entries:
+        payload += struct.pack(">II", count, delta)
+    return _box(b"stts", payload)
+
+
+def _read_audio_stats(trak, movie_timescale):
+    if not movie_timescale:
+        return None
+    ser = None
+    tkhd = None
+    mdhd = None
+    stts = None
+    sizes = None
+    for box in _boxes(trak["payload"]):
+        if box["type"] == b"tkhd":
+            tkhd = box
+        elif box["type"] == b"edts":
+            for child in _boxes(box["payload"]):
+                if child["type"] == b"elst":
+                    payload = child["payload"]
+                    version = payload[0]
+                    count = _u32(payload, 4)
+                    if count:
+                        if version == 1:
+                            ser = (_u64(payload, 8), _u64(payload, 16))
+                        else:
+                            ser = (_u32(payload, 8), _u32(payload, 12))
+        elif box["type"] == b"mdia":
+            for child in _boxes(box["payload"]):
+                if child["type"] == b"mdhd":
+                    mdhd = child
+                elif child["type"] == b"minf":
+                    for minf in _boxes(child["payload"]):
+                        if minf["type"] != b"stbl":
+                            continue
+                        for stbl in _boxes(minf["payload"]):
+                            if stbl["type"] == b"stts":
+                                stts = _stts_entries(stbl)
+                            elif stbl["type"] == b"stsz":
+                                _, sizes = _stsz_info(stbl)
+    if ser is None or tkhd is None or mdhd is None or not stts or not sizes:
+        return None
+    segment_duration, media_time = ser
+    if media_time < 0:
+        return None
+    timescale = _mdhd_timescale(mdhd)
+    if not timescale:
+        return None
+    target = (segment_duration * timescale) // movie_timescale + media_time
+    if target <= 0:
+        return None
+    entries = list(stts)
+    prefix = sum(count * delta for count, delta in entries[:-1])
+    new_delta = target - prefix
+    if new_delta <= 0:
+        return None
+    entries[-1] = (entries[-1][0], new_delta)
+    seconds = target / timescale
+    bitrate = int(sum(sizes) * 8 / seconds) if seconds else 0
+    return {
+        "target_duration": target,
+        "tkhd_duration": segment_duration,
+        "stts": entries,
+        "bitrate": bitrate,
+    }
+
+
+def _rebuild_stbl(stbl, delta, safe_offset, kind, stats):
     output = []
+    video = kind == b"vide"
+    audio = kind == b"soun" and stats.get("audio")
     for box in _boxes(stbl["payload"]):
         if box["type"] in (b"stco", b"co64"):
             if video:
@@ -414,6 +543,8 @@ def _rebuild_stbl(stbl, delta, safe_offset, video, stats):
                 output.append(_shift_stco(box, delta))
         elif video and box["type"] == b"stts":
             output.append(_build_stts(stats["real_count"], stats["sample_delta"]))
+        elif audio and box["type"] == b"stts":
+            output.append(_build_stts_entries(stats["audio"]["stts"]))
         elif video and box["type"] == b"stsc":
             output.append(_build_stsc(stats["stsc"], stats["old_chunks"] + 1))
         elif video and box["type"] == b"stsz":
@@ -422,43 +553,54 @@ def _rebuild_stbl(stbl, delta, safe_offset, video, stats):
             output.append(_box(
                 b"stsd", _patch_btrt_in_stsd(box["payload"], stats["bitrate"])
             ))
+        elif audio and box["type"] == b"stsd":
+            output.append(_box(
+                b"stsd",
+                _patch_audio_stsd(box["payload"], stats["audio"]["bitrate"]),
+            ))
         else:
             output.append(stbl["payload"][box["offset"]:box["end"]])
     return _box(b"stbl", b"".join(output))
 
 
-def _rebuild_minf(minf, delta, safe_offset, video, stats):
+def _rebuild_minf(minf, delta, safe_offset, kind, stats):
     output = []
     for box in _boxes(minf["payload"]):
         if box["type"] == b"stbl":
-            output.append(_rebuild_stbl(box, delta, safe_offset, video, stats))
+            output.append(_rebuild_stbl(box, delta, safe_offset, kind, stats))
         else:
             output.append(minf["payload"][box["offset"]:box["end"]])
     return _box(b"minf", b"".join(output))
 
 
-def _rebuild_mdia(mdia, delta, safe_offset, video, stats):
+def _rebuild_mdia(mdia, delta, safe_offset, kind, stats):
     output = []
     for box in _boxes(mdia["payload"]):
-        if box["type"] == b"mdhd" and video:
+        if box["type"] == b"mdhd" and kind == b"vide":
             output.append(_patch_mdhd(box, stats["total_duration"]))
+        elif box["type"] == b"mdhd" and kind == b"soun" and stats.get("audio"):
+            output.append(_patch_mdhd(box, stats["audio"]["target_duration"]))
         elif box["type"] == b"minf":
-            output.append(_rebuild_minf(box, delta, safe_offset, video, stats))
+            output.append(_rebuild_minf(box, delta, safe_offset, kind, stats))
         else:
             output.append(mdia["payload"][box["offset"]:box["end"]])
     return _box(b"mdia", b"".join(output))
 
 
-def _rebuild_trak(trak, delta, safe_offset, video, stats):
+def _rebuild_trak(trak, delta, safe_offset, kind, stats):
     output = []
     for box in _boxes(trak["payload"]):
         if box["type"] == b"udta" and stats["strip_udta"]:
             continue
-        if box["type"] == b"mdia":
-            output.append(_rebuild_mdia(box, delta, safe_offset, video, stats))
+        if box["type"] == b"tkhd" and kind == b"soun" and stats.get("audio"):
+            output.append(_patch_tkhd_duration(
+                box, stats["audio"]["tkhd_duration"]
+            ))
+        elif box["type"] == b"mdia":
+            output.append(_rebuild_mdia(box, delta, safe_offset, kind, stats))
         else:
             output.append(trak["payload"][box["offset"]:box["end"]])
-    if video:
+    if kind == b"vide":
         output.append(_build_watermark(stats["watermark"]))
     return _box(b"trak", b"".join(output))
 
@@ -470,12 +612,11 @@ def _rebuild_moov(moov, delta, safe_offset, stats):
             continue
         if box["type"] == b"trak":
             output.append(_rebuild_trak(
-                box, delta, safe_offset, _handler_type(box) == b"vide", stats
+                box, delta, safe_offset, _handler_type(box), stats
             ))
         else:
             output.append(moov["payload"][box["offset"]:box["end"]])
     return _box(b"moov", b"".join(output))
-
 
 def patch_bytes(data, config=None):
     """Patch an MP4 byte string and return the rebuilt MP4 bytes."""
@@ -503,6 +644,17 @@ def patch_bytes(data, config=None):
     if len(dummy_payload) < dummy_size:
         dummy_payload += b"\x00" * (dummy_size - len(dummy_payload))
     dummy_payload = dummy_payload[:dummy_size]
+
+    movie_timescale = 0
+    audio_stats = None
+    for child in _boxes(moov["payload"]):
+        if child["type"] == b"mvhd":
+            payload = child["payload"]
+            movie_timescale = (
+                _u32(payload, 20) if payload[0] == 1 else _u32(payload, 12)
+            )
+        elif child["type"] == b"trak" and _handler_type(child) == b"soun":
+            audio_stats = _read_audio_stats(child, movie_timescale)
 
     real_count = 0
     sample_delta = 0
@@ -570,6 +722,7 @@ def patch_bytes(data, config=None):
             "Patched by https://github.com/buwryme/tiktok-lossless-upload",
         ),
         "strip_udta": bool(cfg.get("strip_udta", True)),
+        "audio": audio_stats,
     }
 
     free_box = _box(b"free", b"") if cfg.get("free_box", True) else b""
