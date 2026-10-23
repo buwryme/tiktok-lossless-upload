@@ -7,6 +7,7 @@ all metadata fields are fully customizable.
 
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -25,9 +26,9 @@ CODEC_DUMMY_SIZES = {
 }
 
 
-GIST_RAW_URL = (
-    "https://gist.githubusercontent.com/buwryme/"
-    "e7dd8bca2094995943a855f0af985960/raw/tiktok_patcher.toml"
+GIST_API_URL = (
+    "https://api.github.com/gists/"
+    "e7dd8bca2094995943a855f0af985960"
 )
 
 BUILTIN_TOML = r'''# Reverse engineered from Editing News' patcher and made open source.
@@ -47,6 +48,7 @@ name_box_payload = "buwryy<3"
 inflation_rate = 10
 dummy_sample_size = 8
 trailing_bytes = 184100
+method = "mvhd"
 
 [patcher.dummy_sizes]
 avc1 = 8
@@ -137,8 +139,17 @@ def load_patcher_config(reload=False):
         return _PATCHER_CONFIG
     cfg = _builtin_patcher_defaults()
     try:
-        with urllib.request.urlopen(GIST_RAW_URL, timeout=4) as response:
-            remote = _parse_toml(response.read().decode("utf-8"))["patcher"]
+        request = urllib.request.Request(
+            GIST_API_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "tiktok-lossless-upload",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            text = payload["files"]["tiktok_patcher.toml"]["content"]
+            remote = _parse_toml(text)["patcher"]
         for key, value in remote.items():
             if isinstance(value, dict) and isinstance(cfg.get(key), dict):
                 cfg[key].update(value)
@@ -543,6 +554,12 @@ def patch_video(input_path: str, config: dict = None) -> bool:
     p = Path(input_path)
     output_path = str(p.parent / f"{p.stem}_tiktok.mp4")
 
+    if cfg.get("method", "mvhd") == "mvhd" and p.suffix.lower() == ".mp4":
+        shutil.copy2(input_path, output_path)
+        if not patch_mp4(output_path, cfg, input_path):
+            raise RuntimeError("Patching MP4 structure failed")
+        return True
+
     if cfg["re_encode"]:
         if not encode_for_tiktok(input_path, output_path, cfg.get("crf", 18), cfg.get("codec", "h264")):
             raise RuntimeError("Encoding failed during execution")
@@ -556,7 +573,196 @@ def patch_video(input_path: str, config: dict = None) -> bool:
     return True
 
 
+
+WATERMARK = "Patched by https://github.com/buwryme/tiktok-lossless-upload"
+
+
+def _cb_u32(data, offset):
+    return struct.unpack('>I', data[offset:offset + 4])[0]
+
+
+def _cb_u64(data, offset):
+    return struct.unpack('>Q', data[offset:offset + 8])[0]
+
+
+def _cb_box(box_type, payload):
+    return struct.pack('>I', 8 + len(payload)) + box_type + payload
+
+
+def _cb_fullbox(box_type, version, flags, payload):
+    return _cb_box(
+        box_type,
+        struct.pack('>I', (version << 24) | (flags & 0x00FFFFFF)) + payload,
+    )
+
+
+def _cb_boxes(data, start=0, end=None):
+    end = len(data) if end is None else end
+    pos = start
+    while pos + 8 <= end:
+        size = _cb_u32(data, pos)
+        box_type = data[pos + 4:pos + 8]
+        header = 8
+        if size == 1:
+            size = _cb_u64(data, pos + 8)
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < 8 or pos + size > end:
+            break
+        yield {
+            "offset": pos,
+            "size": size,
+            "type": box_type,
+            "header": header,
+            "end": pos + size,
+            "payload": data[pos + header:pos + size],
+        }
+        pos += size
+
+
+def _cb_upgrade_mvhd(mvhd):
+    body = mvhd[8:]
+    version = body[0]
+    if version == 1:
+        updated = bytearray(body)
+        updated[24:32] = b"\xff" * 8
+        return _cb_box(b"mvhd", bytes(updated))
+    if version != 0 or len(body) < 100:
+        return mvhd
+    updated = bytearray(112)
+    updated[0:4] = struct.pack(">I", 1 << 24)
+    updated[4:12] = struct.pack(">Q", _cb_u32(body, 4))
+    updated[12:20] = struct.pack(">Q", _cb_u32(body, 8))
+    updated[20:24] = body[12:16]
+    updated[24:32] = b"\xff" * 8
+    updated[32:36] = body[20:24]
+    updated[36:38] = body[24:26]
+    updated[38:48] = body[26:36]
+    updated[48:84] = body[36:72]
+    updated[84:108] = body[72:96]
+    updated[108:112] = body[96:100]
+    return _cb_box(b"mvhd", bytes(updated))
+
+
+def _cb_comment_entry(value=WATERMARK):
+    data = _cb_box(
+        b"data",
+        struct.pack(">II", 1, 0) + value.encode("utf-8"),
+    )
+    return _cb_box(b"\xa9cmt", data)
+
+
+def _cb_patch_udta(udta):
+    children = list(_cb_boxes(udta, 8, len(udta)))
+    output = []
+    has_meta = False
+    for child in children:
+        if child["type"] != b"meta":
+            output.append(udta[child["offset"]:child["end"]])
+            continue
+        has_meta = True
+        meta_payload = udta[child["offset"] + 8:child["end"]]
+        meta_children = list(_cb_boxes(meta_payload, 4, len(meta_payload)))
+        new_meta = []
+        has_ilst = False
+        for meta_child in meta_children:
+            if meta_child["type"] != b"ilst":
+                new_meta.append(meta_payload[meta_child["offset"]:meta_child["end"]])
+                continue
+            has_ilst = True
+            ilst_payload = meta_payload[meta_child["offset"] + 8:meta_child["end"]]
+            entries = list(_cb_boxes(ilst_payload, 0, len(ilst_payload)))
+            new_entries = []
+            has_comment = False
+            for entry in entries:
+                if entry["type"] == b"\xa9cmt":
+                    new_entries.append(_cb_comment_entry())
+                    has_comment = True
+                else:
+                    new_entries.append(ilst_payload[entry["offset"]:entry["end"]])
+            if not has_comment:
+                new_entries.append(_cb_comment_entry())
+            new_meta.append(_cb_box(b"ilst", b"".join(new_entries)))
+        if not has_ilst:
+            new_meta.append(_cb_box(b"ilst", _cb_comment_entry()))
+        output.append(_cb_fullbox(b"meta", 0, 0, b"".join(new_meta)))
+    if not has_meta:
+        hdlr = _cb_fullbox(
+            b"hdlr", 0, 0,
+            struct.pack(">I", 0) + b"mdir" + b"\x00" * 12 + b"\x00",
+        )
+        output.append(_cb_fullbox(
+            b"meta", 0, 0,
+            hdlr + _cb_box(b"ilst", _cb_comment_entry()),
+        ))
+    return _cb_box(b"udta", b"".join(output))
+
+
+def _cb_shift_offsets(data, start, end, delta):
+    for box in _cb_boxes(data, start, end):
+        if box["type"] in (b"stco", b"co64"):
+            count = _cb_u32(data, box["offset"] + 12)
+            is64 = box["type"] == b"co64"
+            for index in range(count):
+                offset = box["offset"] + 16 + index * (8 if is64 else 4)
+                value = _cb_u64(data, offset) if is64 else _cb_u32(data, offset)
+                value += delta
+                if is64:
+                    data[offset:offset + 8] = struct.pack(">Q", value)
+                else:
+                    data[offset:offset + 4] = struct.pack(">I", value & 0xFFFFFFFF)
+        elif box["type"] in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+            _cb_shift_offsets(data, box["offset"] + 8, box["end"], delta)
+
+
+def _cb_rebuild(data, delta=0):
+    output = []
+    for box in _cb_boxes(data, 0, len(data)):
+        raw = data[box["offset"]:box["end"]]
+        if box["type"] == b"moov":
+            moov_children = []
+            for child in _cb_boxes(raw, 8, len(raw)):
+                child_raw = raw[child["offset"]:child["end"]]
+                if child["type"] == b"mvhd":
+                    moov_children.append(_cb_upgrade_mvhd(child_raw))
+                elif child["type"] == b"udta":
+                    moov_children.append(_cb_patch_udta(child_raw))
+                else:
+                    moov_children.append(child_raw)
+            moov = _cb_box(b"moov", b"".join(moov_children))
+            if delta:
+                mutable = bytearray(moov)
+                _cb_shift_offsets(mutable, 8, len(mutable), delta)
+                moov = bytes(mutable)
+            output.append(moov)
+        else:
+            output.append(raw)
+    return b"".join(output)
+
+
+def patch_bytes_mvhd(data):
+    old_moov = next(b for b in _cb_boxes(data, 0, len(data)) if b["type"] == b"moov")
+    old_mdat = next(b for b in _cb_boxes(data, 0, len(data)) if b["type"] == b"mdat")
+    probe = _cb_rebuild(data, 0)
+    new_moov = next(b for b in _cb_boxes(probe, 0, len(probe)) if b["type"] == b"moov")
+    delta = new_moov["size"] - old_moov["size"]
+    if old_moov["offset"] > old_mdat["offset"]:
+        delta = 0
+    return _cb_rebuild(data, delta)
+
+
+def patch_mp4_mvhd(input_path, cfg=None):
+    with open(input_path, "rb") as handle:
+        data = handle.read()
+    with open(input_path, "wb") as handle:
+        handle.write(patch_bytes_mvhd(data))
+    return True
+
+
 def patch_mp4(input_path: str, cfg: dict, source_path: str = None) -> bool:
+    if cfg.get("method", "mvhd") == "mvhd":
+        return patch_mp4_mvhd(input_path, cfg)
     try:
         with open(input_path, 'rb') as f:
             raw = f.read()

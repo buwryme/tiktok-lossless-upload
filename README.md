@@ -44,17 +44,20 @@ check out [tikutils](https://github.com/buwryme/tikutils) for an installable app
 
 ## how it works
 
-1.  encodes or remuxes video/audio with optimized ffmpeg settings.
-2.  duplicates the audio track and inflates its `stsz` table with dummy samples.
-3.  removes all `udta` metadata and writes the project metadata back.
-4.  fixes chunk offsets and normalizes the container layout.
-5.  appends the trailing dummy payload to the end of the file.
+the default method is **mvhd**:
 
-tiktok's transcoders choke on the structural mismatch and skip re-encoding. mobile decoders ignore the dummy track and play normally.
+1.  upgrades `mvhd` from version 0 to version 1, preserving creation/modification times, timescale, rate, volume, matrix, and next track ID.
+2.  sets the `mvhd` duration to `0xFFFFFFFFFFFFFFFF`.
+3.  appends or replaces a `©cmt` entry in `udta/meta/ilst` with `Patched by https://github.com/buwryme/tiktok-lossless-upload`.
+4.  shifts `stco`/`co64` chunk offsets by the moov size change.
+
+the `mdat` payload, sample tables, audio/video streams, and trailing data are left byte-for-byte untouched. the container rewrite matches the reference sample; only the project watermark differs.
+
+the previous audio-inflation method is still available by setting `method = "legacy"` in the patcher config.
 
 ## configuration
 
-patcher tuning (inflation rate, codec-specific dummy sizes, metadata, and trailing payload) is fetched from a public `.toml` gist. if the fetch fails, the built-in copy is used. encode settings remain available in the gui and cli.
+patcher tuning (method, inflation rate, codec-specific dummy sizes, metadata, and trailing payload) is fetched from a public `.toml` gist. if the fetch fails, the built-in copy is used. encode settings remain available in the gui and cli.
 
 ---
 
