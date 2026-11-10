@@ -19,15 +19,22 @@ Reverse engineered from Editing News' patcher and made open source.
 
 ## usage
 
+for MP4 input, the default method copies the file and patches the container directly. no re-encode.
+
 ```bash
-python3 tiktok_lossless_patch.py input.mp4 [output.mp4]
+python3 tiktok_lossless_patch.py input.mp4
 ```
 
-encodes to **h.264 crf 18** (visually lossless) + patches the container structure to force passthrough.
+the default method needs one AAC-LC stereo audio track. other inputs are converted first.
 
 ```bash
-python3 tiktok_lossless_patch.py input.mp4 --no-reencode
-python3 tiktok_lossless_patch.py input.mp4 --codec h265 --crf 18
+python3 tiktok_lossless_patch.py input.mov output.mp4
+```
+
+to skip re-encoding non-MP4 input, call the Python API with `re_encode` disabled:
+
+```bash
+python3 -c "from tiktok_lossless_patch import patch_video; patch_video('input.mov', {'re_encode': False})"
 ```
 
 > **tip:** supports *any* video resolution, but up to 1080p60fps is best
@@ -44,16 +51,16 @@ check out [tikutils](https://github.com/buwryme/tikutils) for an installable app
 
 ## how it works
 
-the default method is **mvhd**:
+the default method is **slsr** (silent tail, stereo duplicate):
 
-1.  upgrades `mvhd` from version 0 to version 1, preserving creation/modification times, timescale, rate, volume, matrix, and next track ID.
-2.  sets the `mvhd` duration to `0xFFFFFFFFFFFFFFFF`.
-3.  appends or replaces a `©cmt` entry in `udta/meta/ilst` with `Patched by https://github.com/buwryme/tiktok-lossless-upload`.
-4.  shifts `stco`/`co64` chunk offsets by the moov size change.
+1.  checks that the input is an MP4 with one unencrypted AAC-LC stereo track.
+2.  appends a short silent AAC tail and duplicates the audio track, so both tracks carry the same sample layout.
+3.  renames the original movie box to a free box and appends a rebuilt movie box with the extended audio tables.
+4.  extends the track, movie, and edit-list durations by the tail length.
 
-the `mdat` payload, sample tables, audio/video streams, and trailing data are left byte-for-byte untouched. the container rewrite matches the reference sample; only the project watermark differs.
+the video samples are copied without re-encoding. the `mdat` payload stays where it is, and the original movie box remains in the file as a free box, so the existing chunk offsets still resolve.
 
-the previous audio-inflation method is still available by setting `method = "legacy"` in the patcher config.
+the older header-only method is available with `method = "mvhd"`, and the audio-inflation method with `method = "legacy"`.
 
 ## configuration
 
