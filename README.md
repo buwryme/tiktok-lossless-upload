@@ -25,7 +25,7 @@ for MP4 input, the default method copies the file and patches the container dire
 python3 tiktok_lossless_patch.py input.mp4
 ```
 
-the default method needs one AAC-LC stereo audio track. other inputs are converted first.
+the default method needs a video track and at least one AAC audio track. other inputs are converted first.
 
 ```bash
 python3 tiktok_lossless_patch.py input.mov output.mp4
@@ -51,16 +51,16 @@ check out [tikutils](https://github.com/buwryme/tikutils) for an installable app
 
 ## how it works
 
-the default method is **slsr** (silent tail, stereo duplicate):
+the default method is **obx**:
 
-1.  checks that the input is an MP4 with one unencrypted AAC-LC stereo track.
-2.  appends a short silent AAC tail and duplicates the audio track, so both tracks carry the same sample layout.
-3.  renames the original movie box to a free box and appends a rebuilt movie box with the extended audio tables.
-4.  extends the track, movie, and edit-list durations by the tail length.
+1.  requires a non-fragmented MP4 with a video track and at least one AAC audio track.
+2.  reads the last four audio samples. if they are large enough, it rewrites them with the method's audio tail; otherwise it appends a new media box with four tail samples and updates the audio tables.
+3.  renames the original movie box to a free box and appends a rebuilt movie box.
+4.  adds a `©cmt` comment with the project watermark.
 
-the video samples are copied without re-encoding. the `mdat` payload stays where it is, and the original movie box remains in the file as a free box, so the existing chunk offsets still resolve.
+the video samples are copied without re-encoding. the original media stays in place, so existing chunk offsets still resolve.
 
-the older header-only method is available with `method = "mvhd"`, and the audio-inflation method with `method = "legacy"`.
+the older silent-tail method is available with `method = "slsr"`, the header-only method with `method = "mvhd"`, and the audio-inflation method with `method = "legacy"`.
 
 ## configuration
 

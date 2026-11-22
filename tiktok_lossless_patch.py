@@ -52,7 +52,7 @@ name_box_payload = "buwryy<3"
 inflation_rate = 10
 dummy_sample_size = 8
 trailing_bytes = 184100
-method = "slsr"
+method = "obx"
 
 [patcher.dummy_sizes]
 avc1 = 8
@@ -558,7 +558,7 @@ def patch_video(input_path: str, config: dict = None) -> bool:
     p = Path(input_path)
     output_path = str(p.parent / f"{p.stem}_tiktok.mp4")
 
-    if cfg.get("method", "slsr") in ("slsr", "mvhd") and p.suffix.lower() == ".mp4":
+    if cfg.get("method", "obx") in ("obx", "slsr", "mvhd") and p.suffix.lower() == ".mp4":
         shutil.copy2(input_path, output_path)
         if not patch_mp4(output_path, cfg, input_path):
             raise RuntimeError("Patching MP4 structure failed")
@@ -769,6 +769,14 @@ def patch_mp4_slsr(input_path, cfg=None):
         data = handle.read()
     with open(input_path, "wb") as handle:
         handle.write(patch_bytes_slsr(data))
+    return True
+
+
+def patch_mp4_obx(input_path, cfg=None):
+    with open(input_path, "rb") as handle:
+        data = handle.read()
+    with open(input_path, "wb") as handle:
+        handle.write(patch_bytes_obx(data))
     return True
 
 
@@ -1265,8 +1273,256 @@ def patch_bytes_slsr(data):
     output.append(_slsr_serialize_box(root))
     return b"".join(output)
 
+# obx method: rewrites or appends the four-sample audio tail and rebuilds the movie box.
+
+def _obx_ct(rate_index):
+    bits = []
+
+    def add(value, width):
+        bits.append(format(value, f"0{width}b"))
+
+    for value, width in [
+        (5, 3), (0, 4), (1, 2), (rate_index, 4), (0, 4), (0, 4), (0, 4),
+        (2, 2), (0, 3), (0, 4), (0, 1), (0, 1), (0, 1), (2, 4), (5, 4),
+    ]:
+        add(value, width)
+    text = "".join(bits)
+    text = text.ljust(math.ceil(len(text) / 8) * 8, "0")
+    text += "0" * 8
+    for a in (2, 5):
+        for value, width in [(3, 3), (a, 4), (0, 8), (0, 11), (0, 3)]:
+            text += format(value, f"0{width}b")
+    text += format(7, "03b")
+    text = text.ljust(math.ceil(len(text) / 8) * 8, "0")
+    return bytes(int(text[i:i + 8], 2) for i in range(0, len(text), 8))
+
+
+def _obx_dt(t):
+    e = _slsr_child(t, b"stsd").data
+    assert len(e) >= 44 and _slsr_u32(e, 0) == 0 and _slsr_u32(e, 4) == 1
+    n = e[8:]
+    assert _slsr_u32(n, 0) == len(n) and _slsr_fourcc(n[4:8]) == b"mp4a"
+    assert n[16] == 0 and n[17] == 0
+    assert n[24] == 0 and n[25] in (1, 2)
+    a = _slsr_parse_boxes(n[36:])
+    assert not any(x.name in (b"wave", b"sinf") for x in a)
+    r = [x for x in a if x.name == b"esds"]
+    assert len(r) == 1 and _slsr_u32(r[0].data, 0) == 0
+    o = r[0].data
+    c = _slsr_descriptor(o, 4)
+    assert c[0] == 3 and o[c[1] + 2] == 0
+    found = []
+    pos = c[1] + 3
+    while pos < c[2]:
+        d = _slsr_descriptor(o[:c[2]], pos)
+        if d[0] == 4:
+            assert d[2] - d[1] >= 13 and o[d[1]] == 64
+            inner = d[1] + 13
+            while inner < d[2]:
+                g = _slsr_descriptor(o[:d[2]], inner)
+                if g[0] == 5:
+                    found.append(o[g[1]:g[2]])
+                inner = g[2]
+        pos = d[2]
+    assert len(found) == 1
+    p = found[0]
+    assert len(p) >= 2
+    rate_index = ((p[0] & 7) << 1) | (p[1] >> 7)
+    assert p[0] >> 3 == 2 and rate_index < len(_SLSR_AAC_RATES)
+    assert ((p[1] >> 3) & 15) in (1, 2) and (p[1] & 7) == 0
+    bits = "".join(format(b, "08b") for b in p[2:])
+    assert "1" not in bits or re.fullmatch(r"01010110111001010*", bits)
+    return rate_index
+
+
+def _obx_at(t):
+    e = _slsr_find_child(t, b"stsz") or _slsr_find_child(t, b"stz2")
+    assert e and not (_slsr_find_child(t, b"stsz") and _slsr_find_child(t, b"stz2"))
+    n = e.data
+    assert len(n) >= 12 and n[0] == 0
+    count = _slsr_u32(n, 8)
+    assert 4 < count <= 5_000_000
+    if e.name == b"stsz":
+        uniform = _slsr_u32(n, 4)
+        assert len(n) == 12 + (0 if uniform else count * 4)
+        values = [uniform or _slsr_u32(n, 12 + 4 * i) for i in range(count)]
+    else:
+        width = n[7]
+        assert width in (4, 8, 16) and len(n) == 12 + math.ceil(count * width / 8)
+        if width == 4:
+            values = [(n[12 + (i >> 1)] >> (0 if i % 2 else 4)) & 15 for i in range(count)]
+        elif width == 8:
+            values = [n[12 + i] for i in range(count)]
+        else:
+            values = [_slsr_u32(n, 12 + i * 2) & 0xFFFF for i in range(count)]
+    assert all(values)
+    return {"box": e, "values": values}
+
+
+def _obx_rt(t, sizes, mdats):
+    a = _slsr_find_child(t, b"stco") or _slsr_find_child(t, b"co64")
+    assert a and not (_slsr_find_child(t, b"stco") and _slsr_find_child(t, b"co64"))
+    width = 4 if a.name == b"stco" else 8
+    chunks = _slsr_table_count(a, width)
+    c = _slsr_child(t, b"stsc")
+    runs = [
+        [_slsr_u32(c.data, 8 + 12 * i), _slsr_u32(c.data, 12 + 12 * i), _slsr_u32(c.data, 16 + 12 * i)]
+        for i in range(_slsr_table_count(c, 12))
+    ]
+    assert chunks and runs and runs[0][0] == 1 and runs[-1][0] <= chunks
+    assert all(per > 0 and desc == 1 and (i == 0 or first > runs[i - 1][0])
+               for i, (first, per, desc) in enumerate(runs))
+    run = 0
+    sampled = 0
+    result = []
+    for index in range(chunks):
+        if run + 1 < len(runs) and runs[run + 1][0] <= index + 1:
+            run += 1
+        per = runs[run][1]
+        offset = _slsr_read_int(a.data, 8 + index * width, width)
+        assert sampled + per <= len(sizes)
+        length = sum(sizes[sampled:sampled + per])
+        assert any(offset >= m["at"] + m["width"] and offset + length <= m["at"] + m["size"]
+                   for m in mdats)
+        result.append({"offset": offset, "first": sampled, "count": per, "length": length})
+        sampled += per
+    assert sampled == len(sizes)
+    return {"offsets": a, "sc": c, "list": result}
+
+
+def patch_bytes_obx(data, comment=WATERMARK):
+    tops = []
+    pos = 0
+    while pos < len(data):
+        name, header, size, zero = _slsr_read_header(data[pos:pos + 16], len(data) - pos)
+        assert len(tops) < 10000 and name not in (b"moof", b"mfra", b"sidx", b"ssix")
+        tops.append({"name": name, "at": pos, "size": size, "width": header, "zero": zero})
+        pos += size
+    moovs = [x for x in tops if x["name"] == b"moov"]
+    mdats = [x for x in tops if x["name"] == b"mdat"]
+    assert len(moovs) == 1 and mdats and moovs[0]["size"] <= 256 * 1024 * 1024
+    moov = moovs[0]
+    root = _slsr_parse_boxes(data[moov["at"]:moov["at"] + moov["size"]])[0]
+    forbidden = {b"mvex", b"pssh", b"senc", b"saio", b"saiz", b"iloc", b"encv", b"enca", b"tenc", b"sinf"}
+
+    def check(item):
+        assert item.name not in forbidden
+        for c in item.children or []:
+            check(c)
+
+    check(root)
+    tracks = [x for x in root.children if x.name == b"trak"]
+
+    def handler(track):
+        return _slsr_child(_slsr_child(track, b"mdia"), b"hdlr").data[8:12]
+
+    audio = [x for x in tracks if handler(x) == b"soun"]
+    assert audio and any(handler(x) == b"vide" for x in tracks)
+    ids = []
+    for track in tracks:
+        t = _slsr_child(track, b"tkhd").data
+        assert t[0] in (0, 1)
+        ids.append(_slsr_u32(t, 20 if t[0] == 1 else 12))
+    assert all(ids) and len(set(ids)) == len(ids)
+    g = audio[0]
+    v = _slsr_child(_slsr_child(g, b"mdia"), b"minf")
+    dref = _slsr_child(_slsr_child(v, b"dinf"), b"dref").data
+    refs = _slsr_parse_boxes(dref[8:])
+    assert _slsr_u32(dref, 0) == 0 and _slsr_u32(dref, 4) == len(refs) and refs
+    assert all(x.name == b"url " and _slsr_u32(x.data, 0) == 1 for x in refs)
+    stbl = _slsr_child(v, b"stbl")
+    size_table = _obx_at(stbl)
+    sizes_box, sizes = size_table["box"], size_table["values"]
+    runs = _obx_rt(stbl, sizes, mdats)
+    tail = _obx_ct(_obx_dt(stbl))
+    last = len(sizes) - 4
+    existing = []
+    for chunk in runs["list"]:
+        offset = chunk["offset"]
+        for index in range(chunk["first"], chunk["first"] + chunk["count"]):
+            if index >= last:
+                existing.append((offset, sizes[index]))
+            offset += sizes[index]
+    assert len(existing) == 4
+    in_place = all(length >= len(tail) for _, length in existing)
+    if in_place:
+        for track in tracks:
+            if track is g:
+                continue
+            try:
+                m = _slsr_child(_slsr_child(_slsr_child(track, b"mdia"), b"minf"), b"stbl")
+                other = _obx_at(m)["values"]
+                other_runs = _obx_rt(m, other, mdats)["list"]
+                if any(a < b["offset"] + b["length"] and b["offset"] < a + length
+                       for a, length in existing for b in other_runs):
+                    in_place = False
+            except Exception:
+                in_place = False
+    edits = []
+    extra_mdat = None
+    if in_place:
+        for offset, length in existing:
+            edits.append((offset, offset + length, tail + bytes(length - len(tail))))
+    else:
+        kept = []
+        for chunk in runs["list"]:
+            count = min(chunk["count"], max(0, last - chunk["first"]))
+            if count:
+                kept.append({"offset": chunk["offset"], "count": count})
+        kept.append({"offset": len(data) + 8, "count": 4})
+        wide = runs["offsets"].name == b"co64" or any(x["offset"] > 0xFFFFFFFF for x in kept)
+        runs["offsets"].name = b"co64" if wide else b"stco"
+        _slsr_set_data(runs["offsets"], _slsr_p32s(0, len(kept)) + b"".join(
+            (_slsr_p64 if wide else _slsr_p32)(x["offset"]) for x in kept
+        ))
+        groups = []
+        for index, item in enumerate(kept):
+            if not groups or groups[-1][1] != item["count"]:
+                groups.append([index + 1, item["count"], 1])
+        _slsr_set_data(runs["sc"], _slsr_p32s(0, len(groups)) + b"".join(
+            _slsr_p32s(*group) for group in groups
+        ))
+        sizes_box.name = b"stsz"
+        new_sizes = bytearray(12 + 4 * len(sizes))
+        struct.pack_into(">I", new_sizes, 8, len(sizes))
+        for index, value in enumerate(sizes):
+            struct.pack_into(">I", new_sizes, 12 + 4 * index, value if index < last else len(tail))
+        _slsr_set_data(sizes_box, new_sizes)
+        extra_mdat = _slsr_box(b"mdat", tail * 4)
+
+    udta = _slsr_find_child(root, b"udta")
+    if udta is None:
+        udta = _SlSrBox(b"udta", b"", None, None)
+        root.children.append(udta)
+    existing_udta = udta.data
+    hdlr = _slsr_box(b"hdlr", _slsr_p32s(0, 0) + b"mdir" + bytes(12) + b"\x00")
+    comment_box = _slsr_box(b"\xa9cmt", _slsr_box(b"data", _slsr_p32s(1, 0) + comment.encode("utf-8")))
+    _slsr_set_data(udta, existing_udta + _slsr_box(b"meta", _slsr_p32s(0) + hdlr + _slsr_box(b"ilst", comment_box)))
+
+    edits.append((moov["at"] + 4, moov["at"] + 8, b"free"))
+    for item in tops:
+        if item["zero"]:
+            assert item["size"] <= 0xFFFFFFFF
+            edits.append((item["at"], item["at"] + 4, _slsr_p32(item["size"])))
+    edits.sort(key=lambda x: x[0])
+    output = []
+    cursor = 0
+    for start, end, replacement in edits:
+        assert start >= cursor
+        output.append(data[cursor:start])
+        output.append(replacement)
+        cursor = end
+    output.append(data[cursor:])
+    if extra_mdat is not None:
+        output.append(extra_mdat)
+    output.append(_slsr_serialize_box(root))
+    return b"".join(output)
+
+
 def patch_mp4(input_path: str, cfg: dict, source_path: str = None) -> bool:
-    method = cfg.get("method", "slsr")
+    method = cfg.get("method", "obx")
+    if method == "obx":
+        return patch_mp4_obx(input_path, cfg)
     if method == "slsr":
         return patch_mp4_slsr(input_path, cfg)
     if method == "mvhd":
@@ -1754,7 +2010,7 @@ def main():
 
     cfg = get_config()
     direct = (
-        cfg.get("method", "slsr") in ("slsr", "mvhd")
+        cfg.get("method", "obx") in ("obx", "slsr", "mvhd")
         and Path(input_file).suffix.lower() == ".mp4"
     )
 
