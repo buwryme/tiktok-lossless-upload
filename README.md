@@ -47,7 +47,7 @@ requires `PyGObject`. run from the same directory as the script.
 python3 app.py
 ```
 
-check out [tikutils](https://github.com/buwryme/tikutils) for an installable app!
+check out [tikutils](https://git.buwryy.net/buwryy/tikutils) for an installable app!
 
 ## how it works
 

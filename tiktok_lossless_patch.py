@@ -30,9 +30,9 @@ CODEC_DUMMY_SIZES = {
 }
 
 
-GIST_API_URL = (
-    "https://api.github.com/gists/"
-    "e7dd8bca2094995943a855f0af985960"
+GIST_RAW_URL = (
+    "https://gist.buwryy.net/buwryy/"
+    "c7f5f909e81440d7a28f7045beeadc66/raw/HEAD/tiktok_patcher.toml"
 )
 
 BUILTIN_TOML = r'''# Reverse engineered from Editing News' patcher and made open source.
@@ -144,15 +144,14 @@ def load_patcher_config(reload=False):
     cfg = _builtin_patcher_defaults()
     try:
         request = urllib.request.Request(
-            GIST_API_URL,
+            GIST_RAW_URL,
             headers={
-                "Accept": "application/vnd.github+json",
+                "Accept": "text/plain",
                 "User-Agent": "tiktok-lossless-upload",
             },
         )
         with urllib.request.urlopen(request, timeout=4) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            text = payload["files"]["tiktok_patcher.toml"]["content"]
+            text = response.read().decode("utf-8")
             remote = _parse_toml(text)["patcher"]
         for key, value in remote.items():
             if isinstance(value, dict) and isinstance(cfg.get(key), dict):
@@ -578,7 +577,7 @@ def patch_video(input_path: str, config: dict = None) -> bool:
 
 
 
-WATERMARK = "Patched by https://github.com/buwryme/tiktok-lossless-upload"
+WATERMARK = "Patched by https://git.buwryy.net/buwryy/tiktok-lossless-upload"
 
 
 def _cb_u32(data, offset):
